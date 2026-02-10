@@ -1,0 +1,17 @@
+.:53 {
+    hosts {
+        {$TRAEFIK_IP} {$TRAEFIK_HOST}
+        fallthrough
+    }
+    docker {$DOCKER_ENDPOINT} {
+        domain {$DOCKER_DOMAIN}
+        traefik_cname {$TRAEFIK_HOST}
+        cf_token {$CF_TOKEN}
+        cf_target {$CF_TARGET}
+        cf_zone {$CF_ZONE_DOMAIN} {$CF_ZONE_ID}
+    }
+    forward . {$FORWARD_DNS1} {$FORWARD_DNS2}
+    log
+    errors
+    cache {$CACHE_TTL}
+}
