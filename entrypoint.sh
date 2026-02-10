@@ -72,7 +72,7 @@ cat >> /tmp/Corefile <<COREFILE
 COREFILE
 
 echo "=== Generated Corefile ==="
-cat /tmp/Corefile
+sed 's/\(cf_token\s\+\).*/\1***REDACTED***/' /tmp/Corefile
 echo "=========================="
 
 exec /usr/local/bin/coredns -conf /tmp/Corefile "$@"

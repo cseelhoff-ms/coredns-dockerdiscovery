@@ -19,6 +19,7 @@ Syntax
         compose_domain COMPOSE_DOMAIN_NAME
         traefik_cname TRAEFIK_HOSTNAME
         traefik_a TRAEFIK_IP
+        ttl TTL_SECONDS
         cf_token CLOUDFLARE_API_TOKEN
         cf_email CLOUDFLARE_EMAIL
         cf_key CLOUDFLARE_API_KEY
@@ -45,6 +46,7 @@ Syntax
 * `CNAME_TARGET`: The CNAME target domain for Cloudflare records (e.g. `traefik.homelab.net`).
 * `cf_zone DOMAIN ZONE_ID`: Maps a domain to a Cloudflare zone ID. Can be specified multiple times.
 * `cf_proxied`: Enable Cloudflare proxy (orange cloud) for created records.
+* `TTL_SECONDS`: DNS record TTL in seconds. Default: `3600`.
 * `cf_exclude COMMA_SEPARATED_DOMAINS`: Comma-separated list of domains to exclude from Cloudflare sync.
 
 How To Build
@@ -85,9 +87,8 @@ Run tests
 Deployment
 ----------
 
-The Docker image ships with an embedded `Corefile.default` that uses environment
-variables for all configuration via CoreDNS/Caddy's native `{$VAR:default}` syntax.
-No host-mounted config files are needed.
+The Docker image generates a Corefile at runtime from environment variables via
+its entrypoint script. No host-mounted config files are needed.
 
 ### docker-compose.yml
 
@@ -114,8 +115,9 @@ services:
     environment:
       - TRAEFIK_IP=10.10.10.2
       - TRAEFIK_HOST=traefik.homelab.net
-      - DOCKER_DOMAIN=docker.loc
+      - DOCKER_DOMAIN=homelab.net
       - CF_TOKEN=your-cloudflare-api-token
+      - CF_TARGET=traefik.homelab.net
       - CF_ZONE_DOMAIN=homelab.net
       - CF_ZONE_ID=your-cloudflare-zone-id
       - FORWARD_DNS=1.1.1.1 8.8.8.8
@@ -139,15 +141,19 @@ services:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TRAEFIK_IP` | `10.10.10.2` | IP address of your Traefik host |
-| `TRAEFIK_HOST` | `traefik.homelab.net` | FQDN of Traefik (used as CNAME target and hosts entry) |
-| `DOCKER_ENDPOINT` | `unix:///var/run/docker.sock` | Docker socket path |
-| `DOCKER_DOMAIN` | `docker.loc` | Domain suffix for container-name-based resolution |
+| `TRAEFIK_IP` | *(none)* | IP address of your Traefik host (required with `TRAEFIK_HOST` for the `hosts` block) |
+| `TRAEFIK_HOST` | *(none)* | FQDN of Traefik (used as CNAME target and hosts entry) |
+| `DOCKER_ENDPOINT` | `unix:///var/run/docker.sock` | Docker/Podman socket path |
+| `DOCKER_DOMAIN` | `docker.local` | Domain suffix for container-name-based resolution |
 | `CF_TOKEN` | *(none)* | Cloudflare API token with `Zone:DNS:Edit` permission |
-| `CF_ZONE_DOMAIN` | `homelab.net` | Domain managed in Cloudflare |
+| `CF_TARGET` | *(none)* | CNAME target domain for Cloudflare records (e.g. `traefik.homelab.net`) |
+| `CF_ZONE_DOMAIN` | *(none)* | Domain managed in Cloudflare |
 | `CF_ZONE_ID` | *(none)* | Cloudflare zone ID (found on the zone Overview page) |
 | `FORWARD_DNS` | `1.1.1.1 8.8.8.8` | Upstream DNS servers for non-matching queries |
 | `CACHE_TTL` | `30` | DNS cache duration in seconds |
+
+> **Note:** `traefik_a` mode (returning A records instead of CNAMEs for Traefik-labeled containers)
+> is not available via environment variables. To use it, provide a custom Corefile mounted into the container.
 
 ### Verifying the deployment
 
@@ -158,8 +164,15 @@ Check the container started correctly:
 Expected output:
 
     [docker] start
-    [INFO] CoreDNS-1.10.1
-    [INFO] linux/amd64, go1.21.x
+    [docker] Connecting to Docker endpoint: unix:///var/run/docker.sock
+    [docker] Successfully connected to Docker/Podman API
+    [docker] Event listener registered successfully
+    [docker] Found N running containers at startup
+    ...
+    [docker] Startup container scan complete. Listening for events...
+    .:53
+    CoreDNS-1.10.1
+    linux/amd64, go1.21.x
 
 ### Testing: Traefik label auto-discovery
 
@@ -177,7 +190,9 @@ Wait a moment, then query CoreDNS:
 Expected answer section:
 
     test.homelab.net.    3600    IN    CNAME    traefik.homelab.net.
-    traefik.homelab.net. 3600    IN    A        10.10.10.2
+
+The CNAME target (`traefik.homelab.net`) resolves to the `TRAEFIK_IP` via the `hosts` plugin.
+Some recursive resolvers will chase the CNAME and include the A record automatically.
 
 Check registration in the logs:
 
