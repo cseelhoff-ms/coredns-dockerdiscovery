@@ -140,16 +140,18 @@ func (dd *DockerDiscovery) ServeDNS(ctx context.Context, w dns.ResponseWriter, r
 		} else if result != nil && result.containerInfo.address6 != nil {
 			answers = getAnswer(state.Name(), []net.IP{result.containerInfo.address6}, dd.ttl, true)
 		} else if result != nil && result.containerInfo.address != nil {
-			// in acordance with https://tools.ietf.org/html/rfc6147#section-5.1.2 we should return an empty answer section if no AAAA records are available and a A record is available when the client requested AAAA
-			record := new(dns.AAAA)
-			record.Hdr = dns.RR_Header{
-				Name:     state.Name(),
-				Rrtype:   dns.TypeAAAA,
-				Class:    dns.ClassINET,
-				Ttl:      dd.ttl,
-				Rdlength: 0,
-			}
-			answers = append(answers, record)
+			// Per RFC 6147 section 5.1.2: return a NODATA response (empty answer
+			// section with NOERROR rcode) when no AAAA records are available but
+			// an A record exists. We must NOT add a malformed AAAA record.
+			m := new(dns.Msg)
+			m.SetReply(r)
+			m.Authoritative = true
+			m.RecursionAvailable = false
+			// Empty answer section = NODATA
+			state.SizeAndDo(m)
+			m = state.Scrub(m)
+			w.WriteMsg(m)
+			return dns.RcodeSuccess, nil
 		}
 	case dns.TypeCNAME:
 		result, _ := dd.containerInfoByDomain(state.QName())
