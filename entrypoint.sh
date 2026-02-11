@@ -12,6 +12,7 @@ set -e
 : "${CF_ZONE_ID:=}"
 : "${FORWARD_DNS:=1.1.1.1 8.8.8.8}"
 : "${CACHE_TTL:=30}"
+: "${CNAME_TARGET:=}"
 
 # Build Corefile
 cat > /tmp/Corefile <<COREFILE
@@ -37,6 +38,12 @@ COREFILE
 if [ -n "$TRAEFIK_HOST" ]; then
 cat >> /tmp/Corefile <<COREFILE
         traefik_cname ${TRAEFIK_HOST}
+COREFILE
+fi
+
+if [ -n "$CNAME_TARGET" ]; then
+cat >> /tmp/Corefile <<COREFILE
+        cname_target ${CNAME_TARGET}
 COREFILE
 fi
 

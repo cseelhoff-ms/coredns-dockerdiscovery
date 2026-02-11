@@ -86,6 +86,13 @@ func createPlugin(c *caddy.Controller) (*DockerDiscovery, error) {
 					return dd, c.ArgErr()
 				}
 				labelResolver.hostLabel = c.Val()
+			case "cname_target":
+				if !c.NextArg() || c.Val() == "" {
+					// Skip — CNAME_TARGET env var not set
+					continue
+				}
+				dd.traefikCNAME = c.Val()
+				dd.cnameResolvers = append(dd.cnameResolvers, &LabelResolver{hostLabel: "coredns.dockerdiscovery.hostname"})
 			case "traefik_cname":
 				if !c.NextArg() || c.Val() == "" {
 					// Skip — TRAEFIK_HOST env var not set

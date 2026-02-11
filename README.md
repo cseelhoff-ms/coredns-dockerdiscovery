@@ -16,6 +16,7 @@ Syntax
         hostname_domain HOSTNAME_DOMAIN_NAME
         network_aliases DOCKER_NETWORK
         label LABEL
+        cname_target CNAME_TARGET_HOSTNAME
         compose_domain COMPOSE_DOMAIN_NAME
         traefik_cname TRAEFIK_HOSTNAME
         traefik_a TRAEFIK_IP
@@ -38,6 +39,7 @@ Syntax
     `compose.loc` the fqdn will be `nginx.internal.compose.loc`
 * `DOCKER_NETWORK`: the name of the docker network. Resolve directly by [network aliases](https://docs.docker.com/v17.09/engine/userguide/networking/configure-dns) (like internal docker dns resolve host by aliases whole network)
 * `LABEL`: container label of resolving host (by default enable and equals ```coredns.dockerdiscovery.host```)
+* `CNAME_TARGET_HOSTNAME`: when set, containers with a `coredns.dockerdiscovery.hostname` label will have CNAME records created pointing to this hostname. For example, if `CNAME_TARGET_HOSTNAME` is `infra-1.homelab.local` and a container has the label `coredns.dockerdiscovery.hostname=ldap.homelab.local`, a DNS query for `ldap.homelab.local` will return a CNAME pointing to `infra-1.homelab.local`. Follows the Kubernetes ExternalDNS annotation convention.
 * `TRAEFIK_HOSTNAME`: when set, scans container labels for Traefik router rules (e.g. `traefik.http.routers.*.rule=Host(...)`) and returns CNAME records pointing to this hostname. Mutually exclusive with `traefik_a`.
 * `TRAEFIK_IP`: when set, scans container labels for Traefik router rules and returns A records with this IP address. Mutually exclusive with `traefik_cname`.
 * `CLOUDFLARE_API_TOKEN`: Cloudflare API token (scoped, preferred). Use this OR `cf_email`/`cf_key`.
@@ -151,6 +153,7 @@ services:
 | `CF_ZONE_ID` | *(none)* | Cloudflare zone ID (found on the zone Overview page) |
 | `FORWARD_DNS` | `1.1.1.1 8.8.8.8` | Upstream DNS servers for non-matching queries |
 | `CACHE_TTL` | `30` | DNS cache duration in seconds |
+| `CNAME_TARGET` | *(none)* | CNAME target hostname for `coredns.dockerdiscovery.hostname` labels (e.g. `infra-1.homelab.local`) |
 
 > **Note:** `traefik_a` mode (returning A records instead of CNAMEs for Traefik-labeled containers)
 > is not available via environment variables. To use it, provide a custom Corefile mounted into the container.
@@ -233,6 +236,122 @@ Example
 Container will be resolved by label as `nginx.loc`:
 
     docker run --label=coredns.dockerdiscovery.host=nginx.loc nginx
+
+CNAME Target (non-HTTP services)
+--------------------------------
+
+For services that aren't behind a reverse proxy (LDAP, databases, MQTT, etc.),
+the `cname_target` directive creates CNAME records from a simple Docker label.
+This follows the same pattern as Kubernetes ExternalDNS annotations — containers
+declare the DNS name they want via a label, and the plugin creates a CNAME
+pointing to the Docker host.
+
+### How It Works
+
+1. You configure `cname_target` with the FQDN of the Docker host (set once per CoreDNS instance)
+2. Containers declare `coredns.dockerdiscovery.hostname=<desired-fqdn>` as a label
+3. The plugin creates a CNAME record: `<desired-fqdn>` → `<cname_target>`
+4. When the container stops, the CNAME is removed
+
+If the container moves to a different Docker host running its own CoreDNS with a
+different `cname_target`, the DNS automatically points to the new host.
+
+### Corefile
+
+    .:53 {
+        docker unix:///var/run/docker.sock {
+            cname_target infra-1.homelab.local
+        }
+        forward . 1.1.1.1 8.8.8.8
+    }
+
+Or via environment variable: `CNAME_TARGET=infra-1.homelab.local`
+
+### Example: Mixed HTTP and non-HTTP services
+
+This example shows a typical deployment with HTTP services behind Traefik and
+non-HTTP services exposed directly via port mapping. Both use `cname_target` to
+point DNS at the Docker host.
+
+`Corefile`:
+
+    .:53 {
+        docker unix:///var/run/docker.sock {
+            cname_target infra-1.homelab.local
+            traefik_cname infra-1.homelab.local
+        }
+        forward . 1.1.1.1 8.8.8.8
+    }
+
+`docker-compose.yml`:
+
+```yaml
+services:
+  # ── Non-HTTP: OpenLDAP (ports 389/636) ──────────────────────
+  # Uses coredns.dockerdiscovery.hostname label directly.
+  # No Traefik involvement — LDAP is not an HTTP protocol.
+  openldap:
+    image: osixia/openldap:latest
+    container_name: openldap
+    hostname: ldap
+    ports:
+      - "389:389"
+      - "636:636"
+    labels:
+      - "coredns.dockerdiscovery.hostname=ldap.homelab.local"
+
+  # ── HTTP: phpLDAPadmin (web UI behind Traefik) ──────────────
+  # Uses standard Traefik labels. The plugin reads the Host()
+  # rule and creates a CNAME automatically.
+  phpldapadmin:
+    image: osixia/phpldapadmin:latest
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ldapadmin.rule=Host(`ldapadmin.homelab.local`)"
+      - "traefik.http.routers.ldapadmin.entrypoints=https"
+      - "traefik.http.routers.ldapadmin.tls=true"
+      - "traefik.http.services.ldapadmin.loadbalancer.server.port=80"
+
+  # ── Non-HTTP: PostgreSQL (port 5432) ────────────────────────
+  postgres:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+    labels:
+      - "coredns.dockerdiscovery.hostname=db.homelab.local"
+
+  # ── HTTPS: Gitea (web UI behind Traefik) ────────────────────
+  gitea:
+    image: gitea/gitea:latest
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.gitea.rule=Host(`git.homelab.local`)"
+      - "traefik.http.routers.gitea.entrypoints=https"
+      - "traefik.http.routers.gitea.tls=true"
+      - "traefik.http.services.gitea.loadbalancer.server.port=3000"
+```
+
+**Resulting DNS records:**
+
+| Query | Type | Answer | Source |
+|---|---|---|---|
+| `ldap.homelab.local` | CNAME | `infra-1.homelab.local` | `coredns.dockerdiscovery.hostname` label |
+| `db.homelab.local` | CNAME | `infra-1.homelab.local` | `coredns.dockerdiscovery.hostname` label |
+| `ldapadmin.homelab.local` | CNAME | `infra-1.homelab.local` | Traefik `Host()` rule |
+| `git.homelab.local` | CNAME | `infra-1.homelab.local` | Traefik `Host()` rule |
+
+All four CNAMEs point to `infra-1.homelab.local`, which is resolved by your
+network's existing DNS (DHCP/DDNS, Pi-hole, static entry, etc.) to the Docker
+host's IP address.
+
+**Key points:**
+
+- **HTTP/HTTPS services** (phpLDAPadmin, Gitea): use standard Traefik labels.
+  The plugin reads `Host()` rules via `traefik_cname`. No extra labels needed.
+- **Non-HTTP services** (OpenLDAP, PostgreSQL): use the
+  `coredns.dockerdiscovery.hostname` label. No Traefik labels needed.
+- **Both** produce CNAME records pointing to the same `cname_target` host.
+- When any container stops, its DNS record is automatically removed.
 
 Traefik Label Integration
 -------------------------

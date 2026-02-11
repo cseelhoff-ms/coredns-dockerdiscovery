@@ -41,6 +41,9 @@ type DockerDiscovery struct {
 	containerInfoMap ContainerInfoMap
 	ttl              uint32
 
+	// Resolvers whose results produce CNAME records (e.g. cname_target, traefik labels).
+	cnameResolvers []ContainerDomainResolver
+
 	// Traefik label support: when set, domains from TraefikLabelResolver
 	// produce CNAME or A records pointing to the configured target.
 	traefikResolver *TraefikLabelResolver
@@ -71,6 +74,15 @@ func (dd *DockerDiscovery) resolveDomainsByContainer(container *dockerapi.Contai
 			log.Printf("[docker] Error resolving container domains %s", err)
 		}
 		domains = append(domains, d...)
+	}
+
+	// Resolve CNAME label domains
+	for _, resolver := range dd.cnameResolvers {
+		d, err := resolver.resolve(container)
+		if err != nil {
+			log.Printf("[docker] Error resolving cname label domains %s", err)
+		}
+		cnameDomains = append(cnameDomains, d...)
 	}
 
 	// Resolve traefik label domains separately
@@ -232,6 +244,8 @@ func (dd *DockerDiscovery) getContainerAddress(container *dockerapi.Container, v
 		for netName, network = range container.NetworkSettings.Networks {
 			ok = true
 		}
+	} else if networkMode != "" {
+		network, ok = container.NetworkSettings.Networks[networkMode]
 	}
 
 	if !ok { // sometime while "network:disconnect" event fire

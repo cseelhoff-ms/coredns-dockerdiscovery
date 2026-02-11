@@ -348,3 +348,120 @@ func TestIsTraefikRouterRule(t *testing.T) {
 	assert.False(t, isTraefikRouterRule("traefik.enable"))
 	assert.False(t, isTraefikRouterRule("com.docker.compose.project"))
 }
+
+func TestCnameTargetConfig(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker unix:///home/user/docker.sock {
+	cname_target infra-1.homelab.local
+}`)
+	dd, err := createPlugin(c)
+	assert.Nil(t, err)
+	assert.Equal(t, "infra-1.homelab.local", dd.traefikCNAME)
+	assert.Equal(t, 1, len(dd.cnameResolvers))
+}
+
+func TestCnameTargetDomainResolution(t *testing.T) {
+	networkName := "my_network"
+	c := caddy.NewTestController("dns", fmt.Sprintf(`docker unix:///home/user/docker.sock {
+	domain docker.loc
+	network_aliases %s
+	cname_target infra-1.homelab.local
+}`, networkName))
+	dd, err := createPlugin(c)
+	assert.Nil(t, err)
+
+	address := net.ParseIP("192.11.0.1")
+	container := &dockerapi.Container{
+		ID:   "cd255d6fd141e29256c286070d2d44b3f45f1e46822578f1e7d66c1e7981e6c7",
+		Name: "openldap",
+		Config: &dockerapi.Config{
+			Hostname: "ldap",
+			Labels: map[string]string{
+				"coredns.dockerdiscovery.hostname": "ldap.homelab.local",
+				"coredns.dockerdiscovery.host":     "",
+			},
+		},
+		HostConfig: &dockerapi.HostConfig{
+			NetworkMode: networkName,
+		},
+		NetworkSettings: &dockerapi.NetworkSettings{
+			Networks: map[string]dockerapi.ContainerNetwork{
+				networkName: {
+					Aliases:   []string{"openldap.loc"},
+					IPAddress: address.String(),
+				},
+			},
+		},
+	}
+
+	e := dd.updateContainerInfo(container)
+	assert.Nil(t, e)
+
+	// coredns.dockerdiscovery.hostname label should resolve as CNAME
+	result, err := dd.containerInfoByDomain("ldap.homelab.local.")
+	assert.Nil(t, err)
+	assert.NotNil(t, result)
+	assert.True(t, result.isCNAME)
+
+	// Regular domain should still resolve as A record
+	result, err = dd.containerInfoByDomain("openldap.docker.loc.")
+	assert.Nil(t, err)
+	assert.NotNil(t, result)
+	assert.False(t, result.isCNAME)
+	assert.Equal(t, address.String(), result.containerInfo.address.String())
+}
+
+func TestCnameTargetWithTraefikCname(t *testing.T) {
+	// Both cname_target and traefik_cname can coexist
+	c := caddy.NewTestController("dns", `docker unix:///home/user/docker.sock {
+	cname_target infra-1.homelab.local
+	traefik_cname infra-1.homelab.local
+}`)
+	dd, err := createPlugin(c)
+	assert.Nil(t, err)
+	// traefik_cname overwrites — last writer wins, both set same value
+	assert.Equal(t, "infra-1.homelab.local", dd.traefikCNAME)
+	assert.NotNil(t, dd.traefikResolver)
+	assert.Equal(t, 1, len(dd.cnameResolvers))
+}
+
+func TestCnameTargetWithoutLabel(t *testing.T) {
+	// Container without the hostname label should not produce CNAME records
+	c := caddy.NewTestController("dns", `docker unix:///home/user/docker.sock {
+	cname_target infra-1.homelab.local
+	domain docker.loc
+}`)
+	dd, err := createPlugin(c)
+	assert.Nil(t, err)
+
+	container := &dockerapi.Container{
+		ID:   "ef355d6fd141e29256c286070d2d44b3f45f1e46822578f1e7d66c1e7981e6c7",
+		Name: "plain_container",
+		Config: &dockerapi.Config{
+			Hostname: "plain",
+			Labels: map[string]string{
+				"coredns.dockerdiscovery.host": "plain.docker.loc",
+			},
+		},
+		HostConfig: &dockerapi.HostConfig{
+			NetworkMode: "bridge",
+		},
+		NetworkSettings: &dockerapi.NetworkSettings{
+			IPAddress: "172.17.0.5",
+			Networks:  map[string]dockerapi.ContainerNetwork{},
+		},
+	}
+
+	e := dd.updateContainerInfo(container)
+	assert.Nil(t, e)
+
+	// Should resolve as A record via the label resolver, not CNAME
+	result, err := dd.containerInfoByDomain("plain.docker.loc.")
+	assert.Nil(t, err)
+	assert.NotNil(t, result)
+	assert.False(t, result.isCNAME)
+
+	// No CNAME domain should exist
+	result, err = dd.containerInfoByDomain("ldap.homelab.local.")
+	assert.Nil(t, err)
+	assert.Nil(t, result)
+}
