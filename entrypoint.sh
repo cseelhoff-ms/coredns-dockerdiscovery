@@ -13,20 +13,27 @@ set -e
 : "${FORWARD_DNS:=1.1.1.1 8.8.8.8}"
 : "${CACHE_TTL:=30}"
 : "${CNAME_TARGET:=}"
+: "${CNAME_TARGET_IP:=}"
 
 # Build Corefile
 cat > /tmp/Corefile <<COREFILE
 .:53 {
 COREFILE
 
-# Hosts block (only if TRAEFIK_IP and TRAEFIK_HOST are set)
-if [ -n "$TRAEFIK_IP" ] && [ -n "$TRAEFIK_HOST" ]; then
-cat >> /tmp/Corefile <<COREFILE
-    hosts {
-        ${TRAEFIK_IP} ${TRAEFIK_HOST}
-        fallthrough
-    }
-COREFILE
+# Hosts block — resolve CNAME_TARGET and/or TRAEFIK_HOST to an IP.
+# CNAME_TARGET_IP takes priority; falls back to TRAEFIK_IP.
+HOSTS_IP="${CNAME_TARGET_IP:-$TRAEFIK_IP}"
+HOSTS_ENTRIES=""
+
+if [ -n "$HOSTS_IP" ] && [ -n "$CNAME_TARGET" ]; then
+    HOSTS_ENTRIES="${HOSTS_ENTRIES}        ${HOSTS_IP} ${CNAME_TARGET}\n"
+fi
+if [ -n "$HOSTS_IP" ] && [ -n "$TRAEFIK_HOST" ] && [ "$TRAEFIK_HOST" != "$CNAME_TARGET" ]; then
+    HOSTS_ENTRIES="${HOSTS_ENTRIES}        ${HOSTS_IP} ${TRAEFIK_HOST}\n"
+fi
+
+if [ -n "$HOSTS_ENTRIES" ]; then
+printf "    hosts {\n${HOSTS_ENTRIES}        fallthrough\n    }\n" >> /tmp/Corefile
 fi
 
 # Docker plugin block
@@ -35,7 +42,13 @@ cat >> /tmp/Corefile <<COREFILE
         domain ${DOCKER_DOMAIN}
 COREFILE
 
-if [ -n "$TRAEFIK_HOST" ]; then
+# When CNAME_TARGET is set, use it for traefik_cname too (all CNAMEs point to the host).
+# Otherwise fall back to TRAEFIK_HOST for backward compatibility.
+if [ -n "$CNAME_TARGET" ]; then
+cat >> /tmp/Corefile <<COREFILE
+        traefik_cname ${CNAME_TARGET}
+COREFILE
+elif [ -n "$TRAEFIK_HOST" ]; then
 cat >> /tmp/Corefile <<COREFILE
         traefik_cname ${TRAEFIK_HOST}
 COREFILE

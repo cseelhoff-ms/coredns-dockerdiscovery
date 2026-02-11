@@ -107,15 +107,24 @@ func (dd *DockerDiscovery) containerInfoByDomain(requestName string) (*DomainLoo
 	dd.mutex.RLock()
 	defer dd.mutex.RUnlock()
 
+	// Check CNAME domains first — they take priority over auto-generated
+	// A record domains (e.g. from the domain directive). This prevents
+	// container-name-based A records from shadowing explicit CNAME entries.
+	// Example: container_name "traefik" + domain "177cpt.com" would create
+	// an A record for traefik.177cpt.com pointing to the container IP,
+	// shadowing the intended CNAME from traefik_cname.
+	for _, containerInfo := range dd.containerInfoMap {
+		for _, d := range containerInfo.cnameDomains {
+			if fmt.Sprintf("%s.", d) == requestName {
+				return &DomainLookupResult{containerInfo: containerInfo, isCNAME: true}, nil
+			}
+		}
+	}
+
 	for _, containerInfo := range dd.containerInfoMap {
 		for _, d := range containerInfo.domains {
 			if fmt.Sprintf("%s.", d) == requestName {
 				return &DomainLookupResult{containerInfo: containerInfo, isCNAME: false}, nil
-			}
-		}
-		for _, d := range containerInfo.cnameDomains {
-			if fmt.Sprintf("%s.", d) == requestName {
-				return &DomainLookupResult{containerInfo: containerInfo, isCNAME: true}, nil
 			}
 		}
 	}

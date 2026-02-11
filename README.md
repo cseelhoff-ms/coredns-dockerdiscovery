@@ -115,11 +115,11 @@ services:
       # Podman (rootless): mount the user-level Podman socket
       - /run/user/1000/podman/podman.sock:/var/run/docker.sock
     environment:
-      - TRAEFIK_IP=10.10.10.2
-      - TRAEFIK_HOST=traefik.homelab.net
-      - DOCKER_DOMAIN=homelab.net
+      - CNAME_TARGET=infravm.homelab.net
+      - CNAME_TARGET_IP=10.10.10.2
+      - DOCKER_DOMAIN=docker.local
       - CF_TOKEN=your-cloudflare-api-token
-      - CF_TARGET=traefik.homelab.net
+      - CF_TARGET=infravm.homelab.net
       - CF_ZONE_DOMAIN=homelab.net
       - CF_ZONE_ID=your-cloudflare-zone-id
       - FORWARD_DNS=1.1.1.1 8.8.8.8
@@ -143,17 +143,18 @@ services:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TRAEFIK_IP` | *(none)* | IP address of your Traefik host (required with `TRAEFIK_HOST` for the `hosts` block) |
-| `TRAEFIK_HOST` | *(none)* | FQDN of Traefik (used as CNAME target and hosts entry) |
+| `CNAME_TARGET` | *(none)* | FQDN of the Docker host. All CNAMEs (from `coredns.dockerdiscovery.hostname` labels and Traefik labels) point here. When set, `TRAEFIK_HOST` and `TRAEFIK_IP` are not needed. |
+| `CNAME_TARGET_IP` | *(none)* | IP address of the Docker host. Creates an A record for `CNAME_TARGET` in the `hosts` block. Falls back to `TRAEFIK_IP` if not set. |
+| `TRAEFIK_IP` | *(none)* | IP address of your Traefik host. Used for the `hosts` block when `CNAME_TARGET_IP` is not set. |
+| `TRAEFIK_HOST` | *(none)* | FQDN of Traefik (used as CNAME target when `CNAME_TARGET` is not set; backward compatible) |
 | `DOCKER_ENDPOINT` | `unix:///var/run/docker.sock` | Docker/Podman socket path |
-| `DOCKER_DOMAIN` | `docker.local` | Domain suffix for container-name-based resolution |
+| `DOCKER_DOMAIN` | `docker.local` | Domain suffix for container-name-based resolution. **Caution:** do not set this to your real domain (e.g. `homelab.net`) — it creates `{container_name}.{domain}` A records pointing to container IPs, which can shadow CNAME records. |
 | `CF_TOKEN` | *(none)* | Cloudflare API token with `Zone:DNS:Edit` permission |
 | `CF_TARGET` | *(none)* | CNAME target domain for Cloudflare records (e.g. `traefik.homelab.net`) |
 | `CF_ZONE_DOMAIN` | *(none)* | Domain managed in Cloudflare |
 | `CF_ZONE_ID` | *(none)* | Cloudflare zone ID (found on the zone Overview page) |
 | `FORWARD_DNS` | `1.1.1.1 8.8.8.8` | Upstream DNS servers for non-matching queries |
 | `CACHE_TTL` | `30` | DNS cache duration in seconds |
-| `CNAME_TARGET` | *(none)* | CNAME target hostname for `coredns.dockerdiscovery.hostname` labels (e.g. `infra-1.homelab.local`) |
 
 > **Note:** `traefik_a` mode (returning A records instead of CNAMEs for Traefik-labeled containers)
 > is not available via environment variables. To use it, provide a custom Corefile mounted into the container.

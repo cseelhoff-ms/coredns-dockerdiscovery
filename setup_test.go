@@ -465,3 +465,89 @@ func TestCnameTargetWithoutLabel(t *testing.T) {
 	assert.Nil(t, err)
 	assert.Nil(t, result)
 }
+
+func TestCnamePriorityOverARecord(t *testing.T) {
+	// When DOCKER_DOMAIN matches the real domain, container names can
+	// create A records that collide with CNAME domains from traefik labels.
+	// Example: container_name "traefik" + domain "177cpt.com" creates
+	// traefik.177cpt.com -> A -> container IP, which would shadow the
+	// CNAME from traefik_cname. CNAMEs should always win.
+	networkName := "proxy"
+	c := caddy.NewTestController("dns", fmt.Sprintf(`docker unix:///home/user/docker.sock {
+	domain 177cpt.com
+	network_aliases %s
+	traefik_cname infravm.177cpt.com
+}`, networkName))
+	dd, err := createPlugin(c)
+	assert.Nil(t, err)
+
+	traefikAddress := net.ParseIP("172.18.0.5")
+
+	// Container named "traefik" — the domain resolver will create
+	// traefik.177cpt.com -> A -> 172.18.0.5
+	traefikContainer := &dockerapi.Container{
+		ID:   "aa155d6fd141e29256c286070d2d44b3f45f1e46822578f1e7d66c1e7981e6c7",
+		Name: "traefik",
+		Config: &dockerapi.Config{
+			Hostname: "traefik",
+			Labels: map[string]string{
+				"coredns.dockerdiscovery.host": "",
+			},
+		},
+		HostConfig: &dockerapi.HostConfig{
+			NetworkMode: networkName,
+		},
+		NetworkSettings: &dockerapi.NetworkSettings{
+			Networks: map[string]dockerapi.ContainerNetwork{
+				networkName: {
+					IPAddress: traefikAddress.String(),
+				},
+			},
+		},
+	}
+
+	whoamiAddress := net.ParseIP("172.18.0.10")
+
+	// Container with traefik label Host(`traefik.177cpt.com`) — creates
+	// a CNAME domain for traefik.177cpt.com
+	whoamiContainer := &dockerapi.Container{
+		ID:   "bb255d6fd141e29256c286070d2d44b3f45f1e46822578f1e7d66c1e7981e6c7",
+		Name: "whoami",
+		Config: &dockerapi.Config{
+			Hostname: "whoami",
+			Labels: map[string]string{
+				"traefik.enable":                 "true",
+				"traefik.http.routers.dash.rule": "Host(`traefik.177cpt.com`)",
+				"coredns.dockerdiscovery.host":   "",
+			},
+		},
+		HostConfig: &dockerapi.HostConfig{
+			NetworkMode: networkName,
+		},
+		NetworkSettings: &dockerapi.NetworkSettings{
+			Networks: map[string]dockerapi.ContainerNetwork{
+				networkName: {
+					IPAddress: whoamiAddress.String(),
+				},
+			},
+		},
+	}
+
+	e := dd.updateContainerInfo(traefikContainer)
+	assert.Nil(t, e)
+	e = dd.updateContainerInfo(whoamiContainer)
+	assert.Nil(t, e)
+
+	// traefik.177cpt.com should resolve as CNAME (from traefik label),
+	// NOT as A record (from container name + domain)
+	result, err := dd.containerInfoByDomain("traefik.177cpt.com.")
+	assert.Nil(t, err)
+	assert.NotNil(t, result)
+	assert.True(t, result.isCNAME, "traefik.177cpt.com should be CNAME, not A record")
+
+	// whoami.177cpt.com should be an A record (from container name + domain)
+	result, err = dd.containerInfoByDomain("whoami.177cpt.com.")
+	assert.Nil(t, err)
+	assert.NotNil(t, result)
+	assert.False(t, result.isCNAME)
+}
