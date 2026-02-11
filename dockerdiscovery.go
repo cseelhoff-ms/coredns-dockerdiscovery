@@ -146,7 +146,7 @@ func (dd *DockerDiscovery) ServeDNS(ctx context.Context, w dns.ResponseWriter, r
 			m := new(dns.Msg)
 			m.SetReply(r)
 			m.Authoritative = true
-			m.RecursionAvailable = false
+			m.RecursionAvailable = true
 			// Empty answer section = NODATA
 			state.SizeAndDo(m)
 			m = state.Scrub(m)
@@ -166,7 +166,7 @@ func (dd *DockerDiscovery) ServeDNS(ctx context.Context, w dns.ResponseWriter, r
 
 	m := new(dns.Msg)
 	m.SetReply(r)
-	m.Authoritative, m.RecursionAvailable, m.Compress = true, false, true
+	m.Authoritative, m.RecursionAvailable, m.Compress = true, true, true
 	m.Answer = answers
 
 	state.SizeAndDo(m)
