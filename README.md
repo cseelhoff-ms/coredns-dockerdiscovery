@@ -3,6 +3,72 @@ coredns-dockerdiscovery
 
 Docker discovery plugin for coredns
 
+Why This Fork?
+--------------
+
+This is a fork of [kevinjqiu/coredns-dockerdiscovery](https://github.com/kevinjqiu/coredns-dockerdiscovery)
+that adds CNAME record support, Traefik label integration, and Cloudflare DNS
+sync — capabilities that don't exist in the original project or in the common
+alternative of pairing it with
+[traefik-cloudflare-companion](https://github.com/tiredofit/docker-traefik-cloudflare-companion).
+
+### The problem
+
+The original dockerdiscovery plugin creates **A records pointing to container
+IPs** (e.g. `172.17.0.5`). These IPs are internal to the Docker network and
+**unreachable from other machines on your LAN**. This works for container-to-
+container communication, but not for the common homelab scenario where a laptop,
+phone, or other server needs to reach a containerized service by name.
+
+There is no combination of labels, config directives, or network settings in the
+original that can produce a DNS record pointing to the Docker host's LAN IP.
+Even `--net=host` containers return `nil` and get no DNS record at all.
+
+### What about traefik-cloudflare-companion?
+
+Pairing the original plugin with
+[traefik-cloudflare-companion](https://github.com/tiredofit/docker-traefik-cloudflare-companion)
+solves the Cloudflare half — it reads Traefik labels and creates CNAME records in
+Cloudflare. But it has two gaps:
+
+1. **No local DNS.** The companion only writes to Cloudflare. It does not create
+   any local DNS records. `dig @your-coredns traefik-app.example.com` returns
+   nothing for Traefik-labeled containers — you must wait for Cloudflare
+   propagation and query a public resolver.
+
+2. **HTTP-only.** The companion only reads Traefik labels. Non-HTTP services
+   (LDAP, PostgreSQL, MQTT, etc.) that use port mapping instead of a reverse
+   proxy get no DNS at all — not locally, not in Cloudflare.
+
+### What this fork adds
+
+This fork follows the same architecture that Kubernetes uses with
+[ExternalDNS](https://github.com/kubernetes-sigs/external-dns) + NodePort:
+**DNS records point to the host, the host forwards to the container** (via
+Traefik for HTTP, or kernel port mapping for everything else).
+
+| Feature | Original | Original + companion | This fork |
+|---|---|---|---|
+| Local A records (container IPs) | Yes | Yes | Yes |
+| Local CNAME → Docker host (Traefik labels) | No | No | Yes |
+| Local CNAME → Docker host (non-HTTP labels) | No | No | Yes |
+| Cloudflare sync (Traefik labels) | No | Yes | Yes |
+| Cloudflare sync (non-HTTP labels) | No | No | Yes |
+| Containers required | 1 | 2 | 1 |
+
+The `traefik-cloudflare-companion` remains a more mature choice if you need
+Docker Swarm support, Traefik v1 labels, Traefik API polling, per-domain
+Cloudflare target overrides, regex host filtering, or prebuilt multi-arch images.
+
+### Is this an antipattern?
+
+Exposing containerized non-HTTP services to the LAN via port mapping + DNS is
+the Docker equivalent of Kubernetes NodePort + ExternalDNS. It's the standard
+approach for single-host deployments where containers need to be reachable by
+name from other machines. The alternatives (macvlan networking, host networking,
+service mesh) each trade DNS simplicity for network complexity and are typically
+reserved for multi-host or production-grade clusters.
+
 Name
 ----
 
