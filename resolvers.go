@@ -141,3 +141,17 @@ func (resolver TraefikLabelResolver) resolve(container *dockerapi.Container) ([]
 func isTraefikRouterRule(label string) bool {
 	return strings.HasPrefix(label, "traefik.http.routers.") && strings.HasSuffix(label, ".rule")
 }
+
+// getTraefikServicePort scans container labels for a Traefik service port
+// definition (traefik.http.services.*.loadbalancer.server.port) and returns
+// the port value, or empty string if not found.
+func getTraefikServicePort(labels map[string]string) string {
+	for label, value := range labels {
+		if strings.HasPrefix(label, "traefik.http.services.") &&
+			strings.HasSuffix(label, ".loadbalancer.server.port") &&
+			value != "" {
+			return value
+		}
+	}
+	return ""
+}

@@ -10,6 +10,8 @@ set -e
 : "${CF_TARGET:=}"
 : "${CF_ZONE_DOMAIN:=}"
 : "${CF_ZONE_ID:=}"
+: "${CF_TUNNEL_ID:=}"
+: "${CF_ACCOUNT_ID:=}"
 : "${FORWARD_DNS:=1.1.1.1 8.8.8.8}"
 : "${CACHE_TTL:=30}"
 : "${CNAME_TARGET:=}"
@@ -75,6 +77,18 @@ fi
 if [ -n "$CF_ZONE_DOMAIN" ] && [ -n "$CF_ZONE_ID" ]; then
 cat >> /tmp/Corefile <<COREFILE
         cf_zone ${CF_ZONE_DOMAIN} ${CF_ZONE_ID}
+COREFILE
+fi
+
+if [ -n "$CF_TUNNEL_ID" ]; then
+cat >> /tmp/Corefile <<COREFILE
+        cf_tunnel_id ${CF_TUNNEL_ID}
+COREFILE
+fi
+
+if [ -n "$CF_ACCOUNT_ID" ]; then
+cat >> /tmp/Corefile <<COREFILE
+        cf_account_id ${CF_ACCOUNT_ID}
 COREFILE
 fi
 

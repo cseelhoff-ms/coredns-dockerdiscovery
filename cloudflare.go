@@ -32,6 +32,8 @@ type CloudflareAPI interface {
 	CreateDNSRecord(ctx context.Context, zoneID string, record cloudflare.DNSRecord) (*cloudflare.DNSRecordResponse, error)
 	UpdateDNSRecord(ctx context.Context, zoneID string, recordID string, record cloudflare.DNSRecord) error
 	DeleteDNSRecord(ctx context.Context, zoneID string, recordID string) error
+	GetTunnelConfiguration(ctx context.Context, accountID string, tunnelID string) (cloudflare.TunnelConfigurationResult, error)
+	UpdateTunnelConfiguration(ctx context.Context, accountID string, tunnelID string, config cloudflare.TunnelConfigurationParams) (cloudflare.TunnelConfigurationResult, error)
 }
 
 // cloudflareAPIWrapper wraps the real cloudflare-go API client.
@@ -75,6 +77,14 @@ func (w *cloudflareAPIWrapper) UpdateDNSRecord(ctx context.Context, zoneID strin
 
 func (w *cloudflareAPIWrapper) DeleteDNSRecord(ctx context.Context, zoneID string, recordID string) error {
 	return w.api.DeleteDNSRecord(ctx, cloudflare.ZoneIdentifier(zoneID), recordID)
+}
+
+func (w *cloudflareAPIWrapper) GetTunnelConfiguration(ctx context.Context, accountID string, tunnelID string) (cloudflare.TunnelConfigurationResult, error) {
+	return w.api.GetTunnelConfiguration(ctx, cloudflare.AccountIdentifier(accountID), tunnelID)
+}
+
+func (w *cloudflareAPIWrapper) UpdateTunnelConfiguration(ctx context.Context, accountID string, tunnelID string, config cloudflare.TunnelConfigurationParams) (cloudflare.TunnelConfigurationResult, error) {
+	return w.api.UpdateTunnelConfiguration(ctx, cloudflare.AccountIdentifier(accountID), config)
 }
 
 // CloudflareSyncer manages syncing DNS records to Cloudflare.

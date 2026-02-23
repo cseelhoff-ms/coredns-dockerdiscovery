@@ -16,11 +16,12 @@ import (
 )
 
 type ContainerInfo struct {
-	container    *dockerapi.Container
-	address      net.IP
-	address6     net.IP
-	domains      []string // resolved domains (A/AAAA records)
-	cnameDomains []string // domains resolved via traefik labels (CNAME records)
+	container        *dockerapi.Container
+	address          net.IP
+	address6         net.IP
+	domains          []string // resolved domains (A/AAAA records)
+	cnameDomains     []string // domains resolved via traefik labels (CNAME records)
+	tunnelServiceURL string   // if set, use tunnel routes instead of DNS CNAME
 }
 
 type ContainerInfoMap map[string]*ContainerInfo
@@ -54,6 +55,11 @@ type DockerDiscovery struct {
 	// to Cloudflare whenever containers start/stop.
 	cloudflareSyncer *CloudflareSyncer
 	cloudflareConfig *CloudflareConfig // set during config parsing, consumed at init
+
+	// Cloudflare Tunnel: when configured, containers with the cf_tunnel
+	// label get tunnel ingress routes instead of DNS CNAME records.
+	tunnelSyncer *TunnelSyncer
+	tunnelConfig *TunnelConfig // set during config parsing, consumed at init
 }
 
 // NewDockerDiscovery constructs a new DockerDiscovery object
@@ -317,8 +323,28 @@ func (dd *DockerDiscovery) updateContainerInfo(container *dockerapi.Container) e
 			}
 		}
 
-		// Sync CNAME domains to Cloudflare
-		if dd.cloudflareSyncer != nil && len(cnameDomains) > 0 {
+		// Check for tunnel label — if present, use tunnel routes instead of DNS
+		var tunnelServiceURL string
+		if dd.tunnelSyncer != nil && container.Config != nil {
+			if labelVal, ok := container.Config.Labels["coredns.dockerdiscovery.cf_tunnel"]; ok {
+				if labelVal != "" && labelVal != "true" {
+					tunnelServiceURL = labelVal
+				} else {
+					// Derive from Traefik service port label
+					if port := getTraefikServicePort(container.Config.Labels); port != "" {
+						tunnelServiceURL = "http://localhost:" + port
+					} else {
+						log.Printf("[docker] Container %s has cf_tunnel label but no service URL or Traefik port", container.ID[:12])
+					}
+				}
+			}
+		}
+		dd.containerInfoMap[container.ID].tunnelServiceURL = tunnelServiceURL
+
+		// Sync to Cloudflare: tunnel routes or DNS CNAME (mutually exclusive)
+		if dd.tunnelSyncer != nil && tunnelServiceURL != "" && len(cnameDomains) > 0 {
+			go dd.tunnelSyncer.AddRoutes(cnameDomains, tunnelServiceURL)
+		} else if dd.cloudflareSyncer != nil && len(cnameDomains) > 0 {
 			go dd.cloudflareSyncer.SyncDomains(cnameDomains)
 		}
 	} else if isExist {
@@ -336,8 +362,12 @@ func (dd *DockerDiscovery) removeContainerInfo(containerID string) error {
 		log.Printf("[docker] No entry associated with the container %s", containerID[:12])
 		return nil
 	}
-	// Remove CNAME domains from Cloudflare before deleting
-	if dd.cloudflareSyncer != nil && len(containerInfo.cnameDomains) > 0 {
+	// Remove from Cloudflare: tunnel routes or DNS CNAME (mutually exclusive)
+	if dd.tunnelSyncer != nil && containerInfo.tunnelServiceURL != "" && len(containerInfo.cnameDomains) > 0 {
+		domainsToRemove := make([]string, len(containerInfo.cnameDomains))
+		copy(domainsToRemove, containerInfo.cnameDomains)
+		go dd.tunnelSyncer.RemoveRoutes(domainsToRemove)
+	} else if dd.cloudflareSyncer != nil && len(containerInfo.cnameDomains) > 0 {
 		domainsToRemove := make([]string, len(containerInfo.cnameDomains))
 		copy(domainsToRemove, containerInfo.cnameDomains)
 		go dd.cloudflareSyncer.RemoveDomains(domainsToRemove)

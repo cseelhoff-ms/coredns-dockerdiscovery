@@ -13,15 +13,21 @@ import (
 
 // mockCloudflareAPI implements CloudflareAPI for testing.
 type mockCloudflareAPI struct {
-	mutex   sync.Mutex
-	records map[string][]cloudflare.DNSRecord // zoneID -> records
-	nextID  int
+	mutex         sync.Mutex
+	records       map[string][]cloudflare.DNSRecord              // zoneID -> records
+	tunnelIngress map[string][]cloudflare.UnvalidatedIngressRule // tunnelID -> ingress rules
+	tunnelOrigin  map[string]cloudflare.OriginRequestConfig      // tunnelID -> origin config
+	tunnelWarp    map[string]*cloudflare.WarpRoutingConfig       // tunnelID -> warp config
+	nextID        int
 }
 
 func newMockCloudflareAPI() *mockCloudflareAPI {
 	return &mockCloudflareAPI{
-		records: make(map[string][]cloudflare.DNSRecord),
-		nextID:  1,
+		records:       make(map[string][]cloudflare.DNSRecord),
+		tunnelIngress: make(map[string][]cloudflare.UnvalidatedIngressRule),
+		tunnelOrigin:  make(map[string]cloudflare.OriginRequestConfig),
+		tunnelWarp:    make(map[string]*cloudflare.WarpRoutingConfig),
+		nextID:        1,
 	}
 }
 
@@ -99,6 +105,50 @@ func (m *mockCloudflareAPI) recordCount() int {
 		count += len(recs)
 	}
 	return count
+}
+
+func (m *mockCloudflareAPI) GetTunnelConfiguration(ctx context.Context, accountID string, tunnelID string) (cloudflare.TunnelConfigurationResult, error) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	return cloudflare.TunnelConfigurationResult{
+		TunnelID: tunnelID,
+		Config: cloudflare.TunnelConfiguration{
+			Ingress:       m.tunnelIngress[tunnelID],
+			WarpRouting:   m.tunnelWarp[tunnelID],
+			OriginRequest: m.tunnelOrigin[tunnelID],
+		},
+	}, nil
+}
+
+func (m *mockCloudflareAPI) UpdateTunnelConfiguration(ctx context.Context, accountID string, tunnelID string, config cloudflare.TunnelConfigurationParams) (cloudflare.TunnelConfigurationResult, error) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	m.tunnelIngress[tunnelID] = config.Config.Ingress
+	m.tunnelOrigin[tunnelID] = config.Config.OriginRequest
+	m.tunnelWarp[tunnelID] = config.Config.WarpRouting
+
+	return cloudflare.TunnelConfigurationResult{
+		TunnelID: tunnelID,
+		Config:   config.Config,
+	}, nil
+}
+
+// tunnelIngressCount returns the number of ingress rules for a tunnel.
+func (m *mockCloudflareAPI) tunnelIngressCount(tunnelID string) int {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	return len(m.tunnelIngress[tunnelID])
+}
+
+// tunnelIngressRules returns a copy of the ingress rules for a tunnel.
+func (m *mockCloudflareAPI) tunnelIngressRules(tunnelID string) []cloudflare.UnvalidatedIngressRule {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	rules := make([]cloudflare.UnvalidatedIngressRule, len(m.tunnelIngress[tunnelID]))
+	copy(rules, m.tunnelIngress[tunnelID])
+	return rules
 }
 
 func TestCloudflareSyncDomains(t *testing.T) {
@@ -403,4 +453,281 @@ func TestCloudflareAutoEnablesTraefik(t *testing.T) {
 	// Cloudflare config should auto-enable traefik resolver and set traefik_cname
 	assert.NotNil(t, dd.traefikResolver)
 	assert.Equal(t, "traefik.homelab.net", dd.traefikCNAME)
+}
+
+// --- Tunnel syncer tests ---
+
+func newTunnelTestSetup() (*mockCloudflareAPI, *TunnelSyncer) {
+	mock := newMockCloudflareAPI()
+	tunnelCfg := &TunnelConfig{
+		TunnelID:  "test-tunnel-uuid",
+		AccountID: "test-account-id",
+	}
+	cfCfg := &CloudflareConfig{
+		TargetDomain:   "traefik.homelab.net",
+		Proxied:        false,
+		ExcludeDomains: make(map[string]bool),
+		Zones: []CloudflareZone{
+			{Domain: "homelab.net", ZoneID: "zone_1"},
+		},
+	}
+	// Seed the tunnel with a catch-all rule
+	mock.tunnelIngress[tunnelCfg.TunnelID] = []cloudflare.UnvalidatedIngressRule{
+		{Service: "http_status:404"},
+	}
+	syncer := NewTunnelSyncerWithAPI(tunnelCfg, cfCfg, mock)
+	return mock, syncer
+}
+
+func TestTunnelAddRoutes(t *testing.T) {
+	mock, syncer := newTunnelTestSetup()
+
+	syncer.AddRoutes([]string{"app.homelab.net", "git.homelab.net"}, "http://localhost:8080")
+
+	// Should have 2 ingress rules + catch-all
+	rules := mock.tunnelIngressRules("test-tunnel-uuid")
+	assert.Equal(t, 3, len(rules))
+	assert.Equal(t, "app.homelab.net", rules[0].Hostname)
+	assert.Equal(t, "http://localhost:8080", rules[0].Service)
+	assert.Equal(t, "git.homelab.net", rules[1].Hostname)
+	assert.Equal(t, "http://localhost:8080", rules[1].Service)
+	// Catch-all is last
+	assert.Equal(t, "", rules[2].Hostname)
+	assert.Equal(t, "http_status:404", rules[2].Service)
+
+	// Should also have created 2 DNS CNAME records
+	assert.Equal(t, 2, mock.recordCount())
+	records := mock.allRecords()
+	for _, rec := range records {
+		assert.Equal(t, "CNAME", rec.Type)
+		assert.Equal(t, "test-tunnel-uuid.cfargotunnel.com", rec.Content)
+	}
+}
+
+func TestTunnelAddRoutesIdempotent(t *testing.T) {
+	mock, syncer := newTunnelTestSetup()
+
+	syncer.AddRoutes([]string{"app.homelab.net"}, "http://localhost:8080")
+	syncer.AddRoutes([]string{"app.homelab.net"}, "http://localhost:8080")
+
+	// Should still have 1 ingress rule + catch-all, no duplicates
+	rules := mock.tunnelIngressRules("test-tunnel-uuid")
+	assert.Equal(t, 2, len(rules))
+	assert.Equal(t, "app.homelab.net", rules[0].Hostname)
+
+	// DNS records also not duplicated
+	assert.Equal(t, 1, mock.recordCount())
+}
+
+func TestTunnelAddRoutesUpdateService(t *testing.T) {
+	mock, syncer := newTunnelTestSetup()
+
+	syncer.AddRoutes([]string{"app.homelab.net"}, "http://localhost:8080")
+	syncer.AddRoutes([]string{"app.homelab.net"}, "http://localhost:9090")
+
+	// Should have updated service URL
+	rules := mock.tunnelIngressRules("test-tunnel-uuid")
+	assert.Equal(t, 2, len(rules))
+	assert.Equal(t, "http://localhost:9090", rules[0].Service)
+}
+
+func TestTunnelRemoveRoutes(t *testing.T) {
+	mock, syncer := newTunnelTestSetup()
+
+	syncer.AddRoutes([]string{"app.homelab.net", "git.homelab.net"}, "http://localhost:8080")
+	assert.Equal(t, 3, mock.tunnelIngressCount("test-tunnel-uuid"))
+
+	syncer.RemoveRoutes([]string{"app.homelab.net"})
+
+	// Should have 1 rule + catch-all
+	rules := mock.tunnelIngressRules("test-tunnel-uuid")
+	assert.Equal(t, 2, len(rules))
+	assert.Equal(t, "git.homelab.net", rules[0].Hostname)
+	assert.Equal(t, "http_status:404", rules[1].Service)
+
+	// DNS: only 1 record should remain
+	assert.Equal(t, 1, mock.recordCount())
+	assert.Equal(t, "git.homelab.net", mock.allRecords()[0].Name)
+}
+
+func TestTunnelPreservesCatchAll(t *testing.T) {
+	mock, syncer := newTunnelTestSetup()
+
+	syncer.AddRoutes([]string{"app.homelab.net"}, "http://localhost:8080")
+	syncer.RemoveRoutes([]string{"app.homelab.net"})
+
+	// Should still have the catch-all
+	rules := mock.tunnelIngressRules("test-tunnel-uuid")
+	assert.Equal(t, 1, len(rules))
+	assert.Equal(t, "", rules[0].Hostname)
+	assert.Equal(t, "http_status:404", rules[0].Service)
+}
+
+func TestTunnelDNSRecordContent(t *testing.T) {
+	mock, syncer := newTunnelTestSetup()
+
+	syncer.AddRoutes([]string{"app.homelab.net"}, "http://localhost:8080")
+
+	records := mock.allRecords()
+	assert.Equal(t, 1, len(records))
+	assert.Equal(t, "CNAME", records[0].Type)
+	assert.Equal(t, "app.homelab.net", records[0].Name)
+	assert.Equal(t, "test-tunnel-uuid.cfargotunnel.com", records[0].Content)
+}
+
+func TestTunnelExcludeDomains(t *testing.T) {
+	mock := newMockCloudflareAPI()
+	tunnelCfg := &TunnelConfig{
+		TunnelID:  "test-tunnel-uuid",
+		AccountID: "test-account-id",
+	}
+	cfCfg := &CloudflareConfig{
+		TargetDomain: "traefik.homelab.net",
+		ExcludeDomains: map[string]bool{
+			"internal.homelab.net": true,
+		},
+		Zones: []CloudflareZone{
+			{Domain: "homelab.net", ZoneID: "zone_1"},
+		},
+	}
+	mock.tunnelIngress[tunnelCfg.TunnelID] = []cloudflare.UnvalidatedIngressRule{
+		{Service: "http_status:404"},
+	}
+	syncer := NewTunnelSyncerWithAPI(tunnelCfg, cfCfg, mock)
+
+	syncer.AddRoutes([]string{"app.homelab.net", "internal.homelab.net"}, "http://localhost:8080")
+
+	// Only non-excluded domain should be added
+	rules := mock.tunnelIngressRules("test-tunnel-uuid")
+	assert.Equal(t, 2, len(rules))
+	assert.Equal(t, "app.homelab.net", rules[0].Hostname)
+
+	// Only 1 DNS record
+	assert.Equal(t, 1, mock.recordCount())
+}
+
+func TestTunnelEmptyTunnel(t *testing.T) {
+	mock := newMockCloudflareAPI()
+	tunnelCfg := &TunnelConfig{
+		TunnelID:  "empty-tunnel",
+		AccountID: "test-account-id",
+	}
+	cfCfg := &CloudflareConfig{
+		TargetDomain:   "traefik.homelab.net",
+		ExcludeDomains: make(map[string]bool),
+		Zones: []CloudflareZone{
+			{Domain: "homelab.net", ZoneID: "zone_1"},
+		},
+	}
+	// No existing ingress rules at all
+	syncer := NewTunnelSyncerWithAPI(tunnelCfg, cfCfg, mock)
+
+	syncer.AddRoutes([]string{"app.homelab.net"}, "http://localhost:8080")
+
+	// Should have created the rule + a catch-all
+	rules := mock.tunnelIngressRules("empty-tunnel")
+	assert.Equal(t, 2, len(rules))
+	assert.Equal(t, "app.homelab.net", rules[0].Hostname)
+	assert.Equal(t, "http_status:404", rules[1].Service)
+}
+
+func TestTunnelMultiZone(t *testing.T) {
+	mock := newMockCloudflareAPI()
+	tunnelCfg := &TunnelConfig{
+		TunnelID:  "test-tunnel-uuid",
+		AccountID: "test-account-id",
+	}
+	cfCfg := &CloudflareConfig{
+		TargetDomain:   "traefik.homelab.net",
+		ExcludeDomains: make(map[string]bool),
+		Zones: []CloudflareZone{
+			{Domain: "homelab.net", ZoneID: "zone_1"},
+			{Domain: "example.com", ZoneID: "zone_2"},
+		},
+	}
+	mock.tunnelIngress[tunnelCfg.TunnelID] = []cloudflare.UnvalidatedIngressRule{
+		{Service: "http_status:404"},
+	}
+	syncer := NewTunnelSyncerWithAPI(tunnelCfg, cfCfg, mock)
+
+	syncer.AddRoutes([]string{"app.homelab.net", "web.example.com"}, "http://localhost:8080")
+
+	// DNS records should be in correct zones
+	zone1Recs, _ := mock.ListDNSRecords(context.Background(), "zone_1", cloudflare.DNSRecord{})
+	zone2Recs, _ := mock.ListDNSRecords(context.Background(), "zone_2", cloudflare.DNSRecord{})
+	assert.Equal(t, 1, len(zone1Recs))
+	assert.Equal(t, 1, len(zone2Recs))
+	assert.Equal(t, "test-tunnel-uuid.cfargotunnel.com", zone1Recs[0].Content)
+	assert.Equal(t, "test-tunnel-uuid.cfargotunnel.com", zone2Recs[0].Content)
+}
+
+// --- Tunnel config parsing tests ---
+
+func TestTunnelConfigParsing(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker unix:///home/user/docker.sock {
+	traefik_cname traefik.homelab.net
+	cf_token my-token
+	cf_target traefik.homelab.net
+	cf_zone homelab.net zone123
+	cf_tunnel_id my-tunnel-uuid
+	cf_account_id my-account-id
+}`)
+	dd, err := createPlugin(c)
+	assert.Nil(t, err)
+	assert.NotNil(t, dd.tunnelConfig)
+	assert.Equal(t, "my-tunnel-uuid", dd.tunnelConfig.TunnelID)
+	assert.Equal(t, "my-account-id", dd.tunnelConfig.AccountID)
+	assert.NotNil(t, dd.tunnelSyncer)
+}
+
+func TestTunnelConfigMissingAccountID(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker unix:///home/user/docker.sock {
+	traefik_cname traefik.homelab.net
+	cf_token my-token
+	cf_target traefik.homelab.net
+	cf_zone homelab.net zone123
+	cf_tunnel_id my-tunnel-uuid
+}`)
+	_, err := createPlugin(c)
+	assert.NotNil(t, err)
+	assert.Contains(t, err.Error(), "cf_account_id")
+}
+
+func TestTunnelConfigMissingTunnelID(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker unix:///home/user/docker.sock {
+	traefik_cname traefik.homelab.net
+	cf_token my-token
+	cf_target traefik.homelab.net
+	cf_zone homelab.net zone123
+	cf_account_id my-account-id
+}`)
+	_, err := createPlugin(c)
+	assert.NotNil(t, err)
+	assert.Contains(t, err.Error(), "cf_tunnel_id")
+}
+
+func TestTunnelConfigRequiresAuth(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker unix:///home/user/docker.sock {
+	traefik_cname traefik.homelab.net
+	cf_zone homelab.net zone123
+	cf_tunnel_id my-tunnel-uuid
+	cf_account_id my-account-id
+}`)
+	_, err := createPlugin(c)
+	assert.NotNil(t, err)
+	assert.Contains(t, err.Error(), "cf_token")
+}
+
+func TestTunnelAutoEnablesTraefik(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker unix:///home/user/docker.sock {
+	cf_token my-token
+	cf_zone homelab.net zone123
+	cf_tunnel_id my-tunnel-uuid
+	cf_account_id my-account-id
+}`)
+	dd, err := createPlugin(c)
+	assert.Nil(t, err)
+	// Should auto-enable traefik resolver with tunnel CNAME target
+	assert.NotNil(t, dd.traefikResolver)
+	assert.Equal(t, "my-tunnel-uuid.cfargotunnel.com", dd.traefikCNAME)
 }

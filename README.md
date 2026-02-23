@@ -54,6 +54,7 @@ Traefik for HTTP, or kernel port mapping for everything else).
 | Local CNAME → Docker host (non-HTTP labels) | No | No | Yes |
 | Cloudflare sync (Traefik labels) | No | Yes | Yes |
 | Cloudflare sync (non-HTTP labels) | No | No | Yes |
+| Cloudflare Tunnel routes (per-container) | No | No | Yes |
 | Containers required | 1 | 2 | 1 |
 
 The `traefik-cloudflare-companion` remains a more mature choice if you need
@@ -94,6 +95,8 @@ Syntax
         cf_zone DOMAIN ZONE_ID
         cf_proxied
         cf_exclude COMMA_SEPARATED_DOMAINS
+        cf_tunnel_id CLOUDFLARE_TUNNEL_ID
+        cf_account_id CLOUDFLARE_ACCOUNT_ID
     }
 
 * `DOCKER_ENDPOINT`: the path to the docker socket. If unspecified, defaults to `unix:///var/run/docker.sock`. It can also be TCP socket, such as `tcp://127.0.0.1:999`.
@@ -116,6 +119,8 @@ Syntax
 * `cf_proxied`: Enable Cloudflare proxy (orange cloud) for created records.
 * `TTL_SECONDS`: DNS record TTL in seconds. Default: `3600`.
 * `cf_exclude COMMA_SEPARATED_DOMAINS`: Comma-separated list of domains to exclude from Cloudflare sync.
+* `CLOUDFLARE_TUNNEL_ID`: UUID of the Cloudflare Tunnel. When set (with `cf_account_id`), containers with a `coredns.dockerdiscovery.cf_tunnel` label will get tunnel ingress routes instead of traditional DNS CNAME records.
+* `CLOUDFLARE_ACCOUNT_ID`: Cloudflare Account ID. Required when `cf_tunnel_id` is set.
 
 How To Build
 ------------
@@ -219,6 +224,8 @@ services:
 | `CF_TARGET` | *(none)* | CNAME target domain for Cloudflare records (e.g. `traefik.homelab.net`) |
 | `CF_ZONE_DOMAIN` | *(none)* | Domain managed in Cloudflare |
 | `CF_ZONE_ID` | *(none)* | Cloudflare zone ID (found on the zone Overview page) |
+| `CF_TUNNEL_ID` | *(none)* | Cloudflare Tunnel UUID. Enables per-container tunnel route management via `coredns.dockerdiscovery.cf_tunnel` label. |
+| `CF_ACCOUNT_ID` | *(none)* | Cloudflare Account ID. Required when `CF_TUNNEL_ID` is set. |
 | `FORWARD_DNS` | `1.1.1.1 8.8.8.8` | Upstream DNS servers for non-matching queries |
 | `CACHE_TTL` | `30` | DNS cache duration in seconds |
 
@@ -538,6 +545,129 @@ To enable the Cloudflare proxy (orange cloud) on created records:
 ### Auto-enable Traefik
 
 If you configure `cf_*` options without explicitly setting `traefik_cname` or `traefik_a`, the plugin will automatically enable the Traefik label resolver and set `traefik_cname` to the `cf_target` value.
+
+Cloudflare Tunnel Support
+-------------------------
+
+In addition to traditional Cloudflare DNS CNAME records, this plugin can manage
+**Cloudflare Tunnel published application routes** (ingress rules). This is
+useful when your services are behind a Cloudflare Tunnel and don't need public
+DNS records pointing to your server's IP.
+
+### How it works
+
+Traditional DNS sync and tunnel routes are **mutually exclusive per container**:
+
+- **Default (no label):** Containers get traditional Cloudflare DNS CNAME records
+  pointing to `cf_target` (existing behavior, backward compatible).
+- **`coredns.dockerdiscovery.cf_tunnel` label:** Containers get a tunnel ingress
+  rule instead. The plugin also creates a CNAME DNS record pointing to
+  `<tunnel-id>.cfargotunnel.com` (required by Cloudflare for tunnel routing).
+
+### Configuration
+
+Add `cf_tunnel_id` and `cf_account_id` alongside your existing `cf_*` config:
+
+    .:53 {
+        docker unix:///var/run/docker.sock {
+            traefik_cname traefik.homelab.net
+            cf_token {$CF_TOKEN}
+            cf_target traefik.homelab.net
+            cf_zone homelab.net {$CF_ZONE_ID}
+            cf_tunnel_id {$CF_TUNNEL_ID}
+            cf_account_id {$CF_ACCOUNT_ID}
+        }
+        forward . 1.1.1.1 8.8.8.8
+    }
+
+Or via environment variables: `CF_TUNNEL_ID` and `CF_ACCOUNT_ID`.
+
+> **Note:** `cf_target` is optional when using tunnel-only mode. If omitted,
+> the Traefik resolver will auto-configure with the tunnel CNAME target
+> (`<tunnel-id>.cfargotunnel.com`).
+
+### Container Labels
+
+Add the `coredns.dockerdiscovery.cf_tunnel` label to containers that should use
+tunnel routes:
+
+```yaml
+services:
+  # This container gets a tunnel route (not a traditional DNS CNAME)
+  myapp:
+    image: myapp:latest
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.myapp.rule=Host(`myapp.homelab.net`)"
+      - "traefik.http.services.myapp.loadbalancer.server.port=8080"
+      - "coredns.dockerdiscovery.cf_tunnel=http://localhost:8080"
+
+  # This container gets a traditional DNS CNAME (default behavior)
+  other-app:
+    image: other-app:latest
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.other.rule=Host(`other.homelab.net`)"
+```
+
+**Label values:**
+
+| Value | Behavior |
+|-------|----------|
+| `http://localhost:8080` | Explicit service URL for the tunnel ingress rule |
+| `https://localhost:8443` | HTTPS backend |
+| `tcp://localhost:5432` | TCP service (PostgreSQL, etc.) |
+| `true` | Auto-derive URL from Traefik service port label (`http://localhost:<port>`) |
+
+When the value is `true`, the plugin looks for a
+`traefik.http.services.*.loadbalancer.server.port` label and builds
+`http://localhost:<port>` automatically.
+
+### What happens on container start/stop
+
+**Start** (with `cf_tunnel` label):
+1. Hostname extracted from Traefik router rule (e.g. `myapp.homelab.net`)
+2. Tunnel ingress rule added: `myapp.homelab.net → http://localhost:8080`
+3. DNS CNAME created: `myapp.homelab.net → <tunnel-id>.cfargotunnel.com`
+4. Local CoreDNS CNAME record registered
+
+**Stop:**
+1. Tunnel ingress rule removed
+2. DNS CNAME record deleted
+3. Local CoreDNS record removed
+
+### Mixed tunnel and DNS example
+
+```yaml
+services:
+  coredns:
+    image: coredns-dockerdiscovery:latest
+    environment:
+      - CNAME_TARGET=infravm.homelab.net
+      - CNAME_TARGET_IP=10.10.10.2
+      - CF_TOKEN=your-token
+      - CF_TARGET=infravm.homelab.net
+      - CF_ZONE_DOMAIN=homelab.net
+      - CF_ZONE_ID=your-zone-id
+      - CF_TUNNEL_ID=your-tunnel-uuid
+      - CF_ACCOUNT_ID=your-account-id
+
+  # Tunnel route: accessible via Cloudflare Tunnel (no port forwarding needed)
+  public-app:
+    labels:
+      - "traefik.http.routers.public.rule=Host(`public.homelab.net`)"
+      - "traefik.http.services.public.loadbalancer.server.port=8080"
+      - "coredns.dockerdiscovery.cf_tunnel=http://localhost:8080"
+
+  # DNS CNAME: accessible via traditional DNS (requires port forwarding)
+  internal-app:
+    labels:
+      - "traefik.http.routers.internal.rule=Host(`internal.homelab.net`)"
+```
+
+**Result:**
+- `public.homelab.net` → Tunnel ingress route + CNAME to `<tunnel-id>.cfargotunnel.com`
+- `internal.homelab.net` → Traditional CNAME to `infravm.homelab.net` in Cloudflare DNS
 
 Development
 -----------

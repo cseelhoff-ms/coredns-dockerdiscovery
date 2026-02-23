@@ -191,14 +191,82 @@ func createPlugin(c *caddy.Controller) (*DockerDiscovery, error) {
 						dd.cloudflareConfig.ExcludeDomains[d] = true
 					}
 				}
+			case "cf_tunnel_id":
+				if dd.tunnelConfig == nil {
+					dd.tunnelConfig = &TunnelConfig{}
+				}
+				if !c.NextArg() || c.Val() == "" {
+					continue
+				}
+				dd.tunnelConfig.TunnelID = c.Val()
+			case "cf_account_id":
+				if dd.tunnelConfig == nil {
+					dd.tunnelConfig = &TunnelConfig{}
+				}
+				if !c.NextArg() || c.Val() == "" {
+					continue
+				}
+				dd.tunnelConfig.AccountID = c.Val()
 			default:
 				return dd, c.Errf("unknown property: '%s'", c.Val())
 			}
 		}
 	}
 
+	// Cloudflare Tunnel initialization — only if fully configured
+	if dd.tunnelConfig != nil {
+		hasTunnelID := dd.tunnelConfig.TunnelID != ""
+		hasAccountID := dd.tunnelConfig.AccountID != ""
+
+		if hasTunnelID && hasAccountID {
+			// Tunnel requires Cloudflare credentials + zones
+			if dd.cloudflareConfig == nil {
+				return dd, fmt.Errorf("tunnel: cf_tunnel_id requires cf_token (or cf_key + cf_email) and cf_zone")
+			}
+			hasCredentials := dd.cloudflareConfig.APIToken != "" || (dd.cloudflareConfig.APIKey != "" && dd.cloudflareConfig.APIEmail != "")
+			hasZones := len(dd.cloudflareConfig.Zones) > 0
+			if !hasCredentials || !hasZones {
+				var missing []string
+				if !hasCredentials {
+					missing = append(missing, "cf_token (or cf_key + cf_email)")
+				}
+				if !hasZones {
+					missing = append(missing, "cf_zone")
+				}
+				return dd, fmt.Errorf("tunnel: cf_tunnel_id requires %s", strings.Join(missing, ", "))
+			}
+
+			// Auto-enable traefik resolver if not already configured
+			if dd.traefikResolver == nil {
+				if dd.cloudflareConfig.TargetDomain != "" {
+					dd.traefikCNAME = dd.cloudflareConfig.TargetDomain
+				} else {
+					dd.traefikCNAME = fmt.Sprintf("%s.cfargotunnel.com", dd.tunnelConfig.TunnelID)
+				}
+				dd.traefikResolver = NewTraefikLabelResolver()
+			}
+
+			tunnelSyncer, err := NewTunnelSyncer(dd.tunnelConfig, dd.cloudflareConfig)
+			if err != nil {
+				return dd, err
+			}
+			dd.tunnelSyncer = tunnelSyncer
+			log.Printf("[docker] Cloudflare Tunnel syncer enabled for tunnel %s", dd.tunnelConfig.TunnelID)
+		} else if hasTunnelID || hasAccountID {
+			var missing []string
+			if !hasTunnelID {
+				missing = append(missing, "cf_tunnel_id")
+			}
+			if !hasAccountID {
+				missing = append(missing, "cf_account_id")
+			}
+			return dd, fmt.Errorf("tunnel: incomplete configuration, missing: %s", strings.Join(missing, ", "))
+		}
+	}
+
 	// Cloudflare DNS sync initialization — only if fully configured
-	if dd.cloudflareConfig != nil {
+	// Skip if tunnel syncer is already handling Cloudflare (cf_target not required for tunnels)
+	if dd.cloudflareConfig != nil && dd.tunnelSyncer == nil {
 		// Check if Cloudflare was actually configured (has credentials + target + zones)
 		hasCredentials := dd.cloudflareConfig.APIToken != "" || (dd.cloudflareConfig.APIKey != "" && dd.cloudflareConfig.APIEmail != "")
 		hasTarget := dd.cloudflareConfig.TargetDomain != ""

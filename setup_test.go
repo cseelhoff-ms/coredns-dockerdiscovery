@@ -551,3 +551,26 @@ func TestCnamePriorityOverARecord(t *testing.T) {
 	assert.NotNil(t, result)
 	assert.False(t, result.isCNAME)
 }
+
+func TestGetTraefikServicePort(t *testing.T) {
+	// Standard Traefik service port label
+	labels := map[string]string{
+		"traefik.http.services.web.loadbalancer.server.port": "8080",
+	}
+	assert.Equal(t, "8080", getTraefikServicePort(labels))
+
+	// No matching label
+	labels = map[string]string{
+		"traefik.http.routers.web.rule": "Host(`web.example.com`)",
+	}
+	assert.Equal(t, "", getTraefikServicePort(labels))
+
+	// Empty labels
+	assert.Equal(t, "", getTraefikServicePort(map[string]string{}))
+
+	// Empty port value
+	labels = map[string]string{
+		"traefik.http.services.web.loadbalancer.server.port": "",
+	}
+	assert.Equal(t, "", getTraefikServicePort(labels))
+}
