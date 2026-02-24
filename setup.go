@@ -265,8 +265,7 @@ func createPlugin(c *caddy.Controller) (*DockerDiscovery, error) {
 	}
 
 	// Cloudflare DNS sync initialization — only if fully configured
-	// Skip if tunnel syncer is already handling Cloudflare (cf_target not required for tunnels)
-	if dd.cloudflareConfig != nil && dd.tunnelSyncer == nil {
+	if dd.cloudflareConfig != nil {
 		// Check if Cloudflare was actually configured (has credentials + target + zones)
 		hasCredentials := dd.cloudflareConfig.APIToken != "" || (dd.cloudflareConfig.APIKey != "" && dd.cloudflareConfig.APIEmail != "")
 		hasTarget := dd.cloudflareConfig.TargetDomain != ""
@@ -284,8 +283,8 @@ func createPlugin(c *caddy.Controller) (*DockerDiscovery, error) {
 				return dd, err
 			}
 			dd.cloudflareSyncer = syncer
-		} else if hasCredentials || hasTarget || hasZones {
-			// Partially configured — warn about what's missing
+		} else if dd.tunnelSyncer == nil && (hasCredentials || hasTarget || hasZones) {
+			// Partially configured — warn about what's missing (only when no tunnel syncer)
 			var missing []string
 			if !hasCredentials {
 				missing = append(missing, "cf_token (or cf_key + cf_email)")

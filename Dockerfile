@@ -4,7 +4,7 @@ ARG ALPINE_VERS=3.19
 FROM golang:${GOLANG_VERS}-alpine${ALPINE_VERS}
 
 ARG CGO_ENABLED=1
-ARG PLUGIN_PRIO=50
+ARG PLUGIN_PRIO=57
 ARG COREDNS_VERS=1.10.1
 
 RUN apk --no-cache add build-base git binutils

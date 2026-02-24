@@ -16,7 +16,6 @@ type TunnelConfig struct {
 }
 
 // TunnelSyncer manages adding/removing public hostname routes on a Cloudflare Tunnel.
-// It also creates/deletes CNAME DNS records pointing to <tunnel-id>.cfargotunnel.com.
 type TunnelSyncer struct {
 	api    CloudflareAPI
 	tunnel *TunnelConfig
@@ -57,8 +56,7 @@ func NewTunnelSyncerWithAPI(tunnelCfg *TunnelConfig, cfCfg *CloudflareConfig, ap
 	}
 }
 
-// AddRoutes adds public hostname ingress rules to the tunnel and creates
-// corresponding CNAME DNS records pointing to <tunnel-id>.cfargotunnel.com.
+// AddRoutes adds public hostname ingress rules to the tunnel.
 func (s *TunnelSyncer) AddRoutes(hostnames []string, serviceURL string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -136,18 +134,9 @@ func (s *TunnelSyncer) AddRoutes(hostnames []string, serviceURL string) {
 		}
 	}
 
-	// Create CNAME DNS records pointing to <tunnel-id>.cfargotunnel.com
-	cnameTarget := fmt.Sprintf("%s.cfargotunnel.com", s.tunnel.TunnelID)
-	for _, hostname := range hostnames {
-		if s.cf.ExcludeDomains[hostname] {
-			continue
-		}
-		s.upsertTunnelDNS(ctx, hostname, cnameTarget)
-	}
 }
 
-// RemoveRoutes removes public hostname ingress rules from the tunnel and
-// deletes the corresponding CNAME DNS records.
+// RemoveRoutes removes public hostname ingress rules from the tunnel.
 func (s *TunnelSyncer) RemoveRoutes(hostnames []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -196,93 +185,4 @@ func (s *TunnelSyncer) RemoveRoutes(hostnames []string) {
 		}
 	}
 
-	// Delete CNAME DNS records
-	for _, hostname := range hostnames {
-		if s.cf.ExcludeDomains[hostname] {
-			continue
-		}
-		s.deleteTunnelDNS(ctx, hostname)
-	}
-}
-
-// upsertTunnelDNS creates or updates a CNAME record pointing to the tunnel.
-func (s *TunnelSyncer) upsertTunnelDNS(ctx context.Context, hostname string, cnameTarget string) {
-	zoneID := s.findZoneForDomain(hostname)
-	if zoneID == "" {
-		log.Printf("[tunnel] No zone found for domain: %s", hostname)
-		return
-	}
-
-	existing, err := s.api.ListDNSRecords(ctx, zoneID, cloudflare.DNSRecord{
-		Type: "CNAME",
-		Name: hostname,
-	})
-	if err != nil {
-		log.Printf("[tunnel] Error listing DNS records for %s: %s", hostname, err)
-		return
-	}
-
-	proxied := s.cf.Proxied
-	record := cloudflare.DNSRecord{
-		Type:    "CNAME",
-		Name:    hostname,
-		Content: cnameTarget,
-		Proxied: &proxied,
-		TTL:     1, // auto
-	}
-
-	if len(existing) > 0 {
-		if existing[0].Content == cnameTarget {
-			return
-		}
-		log.Printf("[tunnel] Updating DNS record for %s -> %s", hostname, cnameTarget)
-		if err := s.api.UpdateDNSRecord(ctx, zoneID, existing[0].ID, record); err != nil {
-			log.Printf("[tunnel] Error updating DNS record for %s: %s", hostname, err)
-		}
-		return
-	}
-
-	log.Printf("[tunnel] Creating DNS record for %s -> %s", hostname, cnameTarget)
-	if _, err := s.api.CreateDNSRecord(ctx, zoneID, record); err != nil {
-		log.Printf("[tunnel] Error creating DNS record for %s: %s", hostname, err)
-	}
-}
-
-// deleteTunnelDNS removes CNAME DNS records for a hostname.
-func (s *TunnelSyncer) deleteTunnelDNS(ctx context.Context, hostname string) {
-	zoneID := s.findZoneForDomain(hostname)
-	if zoneID == "" {
-		return
-	}
-
-	existing, err := s.api.ListDNSRecords(ctx, zoneID, cloudflare.DNSRecord{
-		Type: "CNAME",
-		Name: hostname,
-	})
-	if err != nil {
-		log.Printf("[tunnel] Error listing DNS records for %s: %s", hostname, err)
-		return
-	}
-
-	for _, rec := range existing {
-		log.Printf("[tunnel] Deleting DNS record for %s (ID: %s)", hostname, rec.ID)
-		if err := s.api.DeleteDNSRecord(ctx, zoneID, rec.ID); err != nil {
-			log.Printf("[tunnel] Error deleting DNS record for %s: %s", hostname, err)
-		}
-	}
-}
-
-// findZoneForDomain reuses the same zone-matching logic as CloudflareSyncer.
-func (s *TunnelSyncer) findZoneForDomain(domain string) string {
-	var bestMatch string
-	var bestZoneID string
-	for _, zone := range s.cf.Zones {
-		if domain == zone.Domain || len(domain) > len(zone.Domain) && domain[len(domain)-len(zone.Domain)-1] == '.' && domain[len(domain)-len(zone.Domain):] == zone.Domain {
-			if len(zone.Domain) > len(bestMatch) {
-				bestMatch = zone.Domain
-				bestZoneID = zone.ZoneID
-			}
-		}
-	}
-	return bestZoneID
 }

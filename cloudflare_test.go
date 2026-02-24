@@ -495,13 +495,8 @@ func TestTunnelAddRoutes(t *testing.T) {
 	assert.Equal(t, "", rules[2].Hostname)
 	assert.Equal(t, "http_status:404", rules[2].Service)
 
-	// Should also have created 2 DNS CNAME records
-	assert.Equal(t, 2, mock.recordCount())
-	records := mock.allRecords()
-	for _, rec := range records {
-		assert.Equal(t, "CNAME", rec.Type)
-		assert.Equal(t, "test-tunnel-uuid.cfargotunnel.com", rec.Content)
-	}
+	// Should NOT create DNS records (tunnel manages ingress only)
+	assert.Equal(t, 0, mock.recordCount())
 }
 
 func TestTunnelAddRoutesIdempotent(t *testing.T) {
@@ -515,8 +510,8 @@ func TestTunnelAddRoutesIdempotent(t *testing.T) {
 	assert.Equal(t, 2, len(rules))
 	assert.Equal(t, "app.homelab.net", rules[0].Hostname)
 
-	// DNS records also not duplicated
-	assert.Equal(t, 1, mock.recordCount())
+	// No DNS records created
+	assert.Equal(t, 0, mock.recordCount())
 }
 
 func TestTunnelAddRoutesUpdateService(t *testing.T) {
@@ -545,9 +540,8 @@ func TestTunnelRemoveRoutes(t *testing.T) {
 	assert.Equal(t, "git.homelab.net", rules[0].Hostname)
 	assert.Equal(t, "http_status:404", rules[1].Service)
 
-	// DNS: only 1 record should remain
-	assert.Equal(t, 1, mock.recordCount())
-	assert.Equal(t, "git.homelab.net", mock.allRecords()[0].Name)
+	// No DNS records managed by tunnel
+	assert.Equal(t, 0, mock.recordCount())
 }
 
 func TestTunnelPreservesCatchAll(t *testing.T) {
@@ -561,18 +555,6 @@ func TestTunnelPreservesCatchAll(t *testing.T) {
 	assert.Equal(t, 1, len(rules))
 	assert.Equal(t, "", rules[0].Hostname)
 	assert.Equal(t, "http_status:404", rules[0].Service)
-}
-
-func TestTunnelDNSRecordContent(t *testing.T) {
-	mock, syncer := newTunnelTestSetup()
-
-	syncer.AddRoutes([]string{"app.homelab.net"}, "http://localhost:8080")
-
-	records := mock.allRecords()
-	assert.Equal(t, 1, len(records))
-	assert.Equal(t, "CNAME", records[0].Type)
-	assert.Equal(t, "app.homelab.net", records[0].Name)
-	assert.Equal(t, "test-tunnel-uuid.cfargotunnel.com", records[0].Content)
 }
 
 func TestTunnelExcludeDomains(t *testing.T) {
@@ -602,8 +584,8 @@ func TestTunnelExcludeDomains(t *testing.T) {
 	assert.Equal(t, 2, len(rules))
 	assert.Equal(t, "app.homelab.net", rules[0].Hostname)
 
-	// Only 1 DNS record
-	assert.Equal(t, 1, mock.recordCount())
+	// No DNS records created by tunnel
+	assert.Equal(t, 0, mock.recordCount())
 }
 
 func TestTunnelEmptyTunnel(t *testing.T) {
@@ -652,13 +634,14 @@ func TestTunnelMultiZone(t *testing.T) {
 
 	syncer.AddRoutes([]string{"app.homelab.net", "web.example.com"}, "http://localhost:8080")
 
-	// DNS records should be in correct zones
-	zone1Recs, _ := mock.ListDNSRecords(context.Background(), "zone_1", cloudflare.DNSRecord{})
-	zone2Recs, _ := mock.ListDNSRecords(context.Background(), "zone_2", cloudflare.DNSRecord{})
-	assert.Equal(t, 1, len(zone1Recs))
-	assert.Equal(t, 1, len(zone2Recs))
-	assert.Equal(t, "test-tunnel-uuid.cfargotunnel.com", zone1Recs[0].Content)
-	assert.Equal(t, "test-tunnel-uuid.cfargotunnel.com", zone2Recs[0].Content)
+	// Both ingress rules should be created
+	rules := mock.tunnelIngressRules("test-tunnel-uuid")
+	assert.Equal(t, 3, len(rules))
+	assert.Equal(t, "app.homelab.net", rules[0].Hostname)
+	assert.Equal(t, "web.example.com", rules[1].Hostname)
+
+	// No DNS records created by tunnel
+	assert.Equal(t, 0, mock.recordCount())
 }
 
 // --- Tunnel config parsing tests ---
@@ -678,6 +661,8 @@ func TestTunnelConfigParsing(t *testing.T) {
 	assert.Equal(t, "my-tunnel-uuid", dd.tunnelConfig.TunnelID)
 	assert.Equal(t, "my-account-id", dd.tunnelConfig.AccountID)
 	assert.NotNil(t, dd.tunnelSyncer)
+	// cloudflareSyncer should also be created when cf_target is set alongside tunnel
+	assert.NotNil(t, dd.cloudflareSyncer)
 }
 
 func TestTunnelConfigMissingAccountID(t *testing.T) {

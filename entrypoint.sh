@@ -12,6 +12,7 @@ set -e
 : "${CF_ZONE_ID:=}"
 : "${CF_TUNNEL_ID:=}"
 : "${CF_ACCOUNT_ID:=}"
+: "${CF_EXCLUDE:=}"
 : "${FORWARD_DNS:=1.1.1.1 8.8.8.8}"
 : "${CACHE_TTL:=30}"
 : "${CNAME_TARGET:=}"
@@ -89,6 +90,12 @@ fi
 if [ -n "$CF_ACCOUNT_ID" ]; then
 cat >> /tmp/Corefile <<COREFILE
         cf_account_id ${CF_ACCOUNT_ID}
+COREFILE
+fi
+
+if [ -n "$CF_EXCLUDE" ]; then
+cat >> /tmp/Corefile <<COREFILE
+        cf_exclude ${CF_EXCLUDE}
 COREFILE
 fi
 

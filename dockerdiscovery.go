@@ -149,6 +149,11 @@ func (dd *DockerDiscovery) ServeDNS(ctx context.Context, w dns.ResponseWriter, r
 			if dd.traefikCNAME != "" {
 				// Return CNAME record pointing to the traefik server
 				answers = getCNAMEAnswer(state.Name(), dd.traefikCNAME, dd.ttl)
+				// Chase the CNAME: resolve the target through the plugin chain
+				// so the client gets both CNAME + A in one response
+				if extra := dd.chaseCNAME(ctx, w, dd.traefikCNAME, dns.TypeA); extra != nil {
+					answers = append(answers, extra...)
+				}
 			} else if dd.traefikA != nil {
 				// Return A record with the configured traefik IP
 				answers = getAnswer(state.Name(), []net.IP{dd.traefikA}, dd.ttl, false)
@@ -162,6 +167,9 @@ func (dd *DockerDiscovery) ServeDNS(ctx context.Context, w dns.ResponseWriter, r
 			// For CNAME/traefik domains, return the CNAME for AAAA queries too
 			if dd.traefikCNAME != "" {
 				answers = getCNAMEAnswer(state.Name(), dd.traefikCNAME, dd.ttl)
+				if extra := dd.chaseCNAME(ctx, w, dd.traefikCNAME, dns.TypeAAAA); extra != nil {
+					answers = append(answers, extra...)
+				}
 			}
 			// For traefik_a mode, we don't return AAAA records (IPv4 only)
 		} else if result != nil && result.containerInfo.address6 != nil {
@@ -528,4 +536,26 @@ func getAnswer(zone string, ips []net.IP, ttl uint32, v6 bool) []dns.RR {
 		}
 	}
 	return answers
+}
+
+// chaseCNAME resolves a CNAME target by issuing a loopback DNS query to
+// the server's own listener. This ensures the query traverses the full
+// plugin chain from the top (e.g. hosts → docker → forward), unlike
+// plugin.NextOrFailure which only reaches plugins after the current one.
+func (dd *DockerDiscovery) chaseCNAME(ctx context.Context, w dns.ResponseWriter, target string, qtype uint16) []dns.RR {
+	if !strings.HasSuffix(target, ".") {
+		target += "."
+	}
+	m := new(dns.Msg)
+	m.SetQuestion(target, qtype)
+	m.RecursionDesired = true
+
+	c := new(dns.Client)
+	c.Net = "udp"
+	addr := w.LocalAddr().String()
+	r, _, err := c.Exchange(m, addr)
+	if err != nil || r == nil || r.Rcode != dns.RcodeSuccess {
+		return nil
+	}
+	return r.Answer
 }
