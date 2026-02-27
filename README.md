@@ -125,6 +125,10 @@ Syntax
 How To Build
 ------------
 
+```
+docker build -t coredns-dockerdiscovery:latest . && docker save coredns-dockerdiscovery:latest -o coredns-dockerdiscovery.tar && cp coredns-dockerdiscovery.tar /mnt/c/Users/cseelhoff/Downloads && rm coredns-dockerdiscovery.tar
+```
+
 ### Docker (recommended)
 
     docker build -t coredns-dockerdiscovery:latest .

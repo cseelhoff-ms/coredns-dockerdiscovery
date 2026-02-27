@@ -367,7 +367,7 @@ func (dd *DockerDiscovery) removeContainerInfo(containerID string) error {
 
 	containerInfo, ok := dd.containerInfoMap[containerID]
 	if !ok {
-		log.Printf("[docker] No entry associated with the container %s", containerID[:12])
+		log.Printf("[docker] No entry associated with the container %s", shortID(containerID))
 		return nil
 	}
 	// Remove from Cloudflare: tunnel routes or DNS CNAME (mutually exclusive)
@@ -444,52 +444,60 @@ func (dd *DockerDiscovery) start() error {
 	for msg := range events {
 		go func(msg *dockerapi.APIEvents) {
 			event := fmt.Sprintf("%s:%s", msg.Type, msg.Action)
-			log.Printf("[docker] Received event: %s (actor: %s)", event, msg.Actor.ID[:12])
+			log.Printf("[docker] Received event: %s (actor: %s)", event, shortID(msg.Actor.ID))
 			switch event {
 			case "container:start":
 				log.Println("[docker] New container spawned. Attempt to add A/AAAA records for it")
 
 				container, err := dd.dockerClient.InspectContainerWithOptions(dockerapi.InspectContainerOptions{ID: msg.Actor.ID})
 				if err != nil {
-					log.Printf("[docker] Event error %s #%s: %s", event, msg.Actor.ID[:12], err)
+					log.Printf("[docker] Event error %s #%s: %s", event, shortID(msg.Actor.ID), err)
 					return
 				}
 				if err := dd.updateContainerInfo(container); err != nil {
-					log.Printf("[docker] Error adding A/AAAA records for container %s: %s", container.ID[:12], err)
+					log.Printf("[docker] Error adding A/AAAA records for container %s: %s", shortID(container.ID), err)
 				}
 			case "container:die":
-				log.Println("[docker] Container being stopped. Attempt to remove its A/AAAA records from the DNS", msg.Actor.ID[:12])
+				log.Println("[docker] Container being stopped. Attempt to remove its A/AAAA records from the DNS", shortID(msg.Actor.ID))
 				if err := dd.removeContainerInfo(msg.Actor.ID); err != nil {
-					log.Printf("[docker] Error deleting A/AAAA records for container: %s: %s", msg.Actor.ID[:12], err)
+					log.Printf("[docker] Error deleting A/AAAA records for container: %s: %s", shortID(msg.Actor.ID), err)
 				}
 			case "network:connect":
 				// take a look https://gist.github.com/josefkarasek/be9bac36921f7bc9a61df23451594fbf for example of same event's types attributes
-				log.Printf("[docker] Container %s being connected to network %s.", msg.Actor.Attributes["container"][:12], msg.Actor.Attributes["name"])
+				log.Printf("[docker] Container %s being connected to network %s.", shortID(msg.Actor.Attributes["container"]), msg.Actor.Attributes["name"])
 
 				container, err := dd.dockerClient.InspectContainerWithOptions(dockerapi.InspectContainerOptions{ID: msg.Actor.Attributes["container"]})
 				if err != nil {
-					log.Printf("[docker] Event error %s #%s: %s", event, msg.Actor.Attributes["container"][:12], err)
+					log.Printf("[docker] Event error %s #%s: %s", event, shortID(msg.Actor.Attributes["container"]), err)
 					return
 				}
 				if err := dd.updateContainerInfo(container); err != nil {
-					log.Printf("[docker] Error adding A/AAAA records for container %s: %s", container.ID[:12], err)
+					log.Printf("[docker] Error adding A/AAAA records for container %s: %s", shortID(container.ID), err)
 				}
 			case "network:disconnect":
-				log.Printf("[docker] Container %s being disconnected from network %s", msg.Actor.Attributes["container"][:12], msg.Actor.Attributes["name"])
+				log.Printf("[docker] Container %s being disconnected from network %s", shortID(msg.Actor.Attributes["container"]), msg.Actor.Attributes["name"])
 
 				container, err := dd.dockerClient.InspectContainerWithOptions(dockerapi.InspectContainerOptions{ID: msg.Actor.Attributes["container"]})
 				if err != nil {
-					log.Printf("[docker] Event error %s #%s: %s", event, msg.Actor.Attributes["container"][:12], err)
+					log.Printf("[docker] Event error %s #%s: %s", event, shortID(msg.Actor.Attributes["container"]), err)
 					return
 				}
 				if err := dd.updateContainerInfo(container); err != nil {
-					log.Printf("[docker] Error adding A/AAAA records for container %s: %s", container.ID[:12], err)
+					log.Printf("[docker] Error adding A/AAAA records for container %s: %s", shortID(container.ID), err)
 				}
 			}
 		}(msg)
 	}
 
 	return errors.New("docker event loop closed")
+}
+
+// shortID safely truncates an ID string to at most 12 characters.
+func shortID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
 }
 
 // getCNAMEAnswer creates a CNAME DNS response record.
