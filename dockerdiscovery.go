@@ -220,6 +220,15 @@ func (dd *DockerDiscovery) Name() string {
 
 func (dd *DockerDiscovery) getContainerAddress(container *dockerapi.Container, v6 bool) (net.IP, error) {
 
+	// Allow explicit IP override via label
+	if !v6 {
+		if addrStr, ok := container.Config.Labels["coredns.dockerdiscovery.address"]; ok && addrStr != "" {
+			if ip := net.ParseIP(addrStr); ip != nil && ip.To4() != nil {
+				return ip, nil
+			}
+		}
+	}
+
 	// save this away
 	netName, hasNetName := container.Config.Labels["coredns.dockerdiscovery.network"]
 
@@ -444,6 +453,9 @@ func (dd *DockerDiscovery) start() error {
 	for msg := range events {
 		go func(msg *dockerapi.APIEvents) {
 			event := fmt.Sprintf("%s:%s", msg.Type, msg.Action)
+			if msg.Action == "health_status" || strings.HasPrefix(msg.Action, "health_status:") {
+				return
+			}
 			log.Printf("[docker] Received event: %s (actor: %s)", event, shortID(msg.Actor.ID))
 			switch event {
 			case "container:start":
