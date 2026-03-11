@@ -4,7 +4,6 @@ ARG ALPINE_VERS=3.19
 FROM golang:${GOLANG_VERS}-alpine${ALPINE_VERS}
 
 ARG CGO_ENABLED=1
-ARG PLUGIN_PRIO=57
 ARG COREDNS_VERS=1.10.1
 
 RUN apk --no-cache add build-base git binutils
@@ -14,7 +13,7 @@ WORKDIR /coredns
 RUN go mod download
 
 COPY ./ /plugin/dockerdiscovery
-RUN sed -i "s/^#.*//g; /^$/d; ${PLUGIN_PRIO} i docker:dockerdiscovery" plugin.cfg \
+RUN sed -i "s/^#.*//g; /^$/d; /^hosts:hosts$/i docker:dockerdiscovery" plugin.cfg \
     && go mod edit -replace \
     dockerdiscovery=/plugin/dockerdiscovery \
     && go generate coredns.go \

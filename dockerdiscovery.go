@@ -196,7 +196,7 @@ func (dd *DockerDiscovery) ServeDNS(ctx context.Context, w dns.ResponseWriter, r
 	}
 
 	if len(answers) == 0 {
-		return plugin.NextOrFailure(dd.Name(), dd.Next, ctx, w, r)
+		return plugin.NextOrFailure(dd.Name(), dd.Next, ctx, &raResponseWriter{ResponseWriter: w}, r)
 	}
 
 	m := new(dns.Msg)
@@ -578,4 +578,18 @@ func (dd *DockerDiscovery) chaseCNAME(ctx context.Context, w dns.ResponseWriter,
 		return nil
 	}
 	return r.Answer
+}
+
+// raResponseWriter wraps a dns.ResponseWriter and ensures the
+// RecursionAvailable (RA) flag is set on all outgoing responses.
+// This is needed because some downstream plugins (e.g. hosts) don't
+// set RA, which causes resolvers like nslookup to skip the response
+// and fall through to a secondary nameserver.
+type raResponseWriter struct {
+	dns.ResponseWriter
+}
+
+func (w *raResponseWriter) WriteMsg(m *dns.Msg) error {
+	m.RecursionAvailable = true
+	return w.ResponseWriter.WriteMsg(m)
 }
