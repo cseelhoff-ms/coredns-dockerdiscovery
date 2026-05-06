@@ -17,6 +17,8 @@ set -e
 : "${CACHE_TTL:=30}"
 : "${CNAME_TARGET:=}"
 : "${CNAME_TARGET_IP:=}"
+: "${INVENTORY_ADDR:=}"
+: "${INVENTORY_PATH:=}"
 
 # Build Corefile
 cat > /tmp/Corefile <<COREFILE
@@ -96,6 +98,12 @@ fi
 if [ -n "$CF_EXCLUDE" ]; then
 cat >> /tmp/Corefile <<COREFILE
         cf_exclude ${CF_EXCLUDE}
+COREFILE
+fi
+
+if [ -n "$INVENTORY_ADDR" ]; then
+cat >> /tmp/Corefile <<COREFILE
+        inventory ${INVENTORY_ADDR} ${INVENTORY_PATH}
 COREFILE
 fi
 

@@ -97,6 +97,7 @@ Syntax
         cf_exclude COMMA_SEPARATED_DOMAINS
         cf_tunnel_id CLOUDFLARE_TUNNEL_ID
         cf_account_id CLOUDFLARE_ACCOUNT_ID
+        inventory ADDR [PATH]
     }
 
 * `DOCKER_ENDPOINT`: the path to the docker socket. If unspecified, defaults to `unix:///var/run/docker.sock`. It can also be TCP socket, such as `tcp://127.0.0.1:999`.
@@ -121,6 +122,13 @@ Syntax
 * `cf_exclude COMMA_SEPARATED_DOMAINS`: Comma-separated list of domains to exclude from Cloudflare sync.
 * `CLOUDFLARE_TUNNEL_ID`: UUID of the Cloudflare Tunnel. When set (with `cf_account_id`), containers with a `coredns.dockerdiscovery.cf_tunnel` label will get tunnel ingress routes instead of traditional DNS CNAME records.
 * `CLOUDFLARE_ACCOUNT_ID`: Cloudflare Account ID. Required when `cf_tunnel_id` is set.
+* `inventory ADDR [PATH]`: when set, starts a small HTTP server on `ADDR`
+  (e.g. `:8081` or `127.0.0.1:8081`) that exposes the live in-memory record
+  table. JSON is served at `PATH` (default `/inventory`); HTML at
+  `PATH.html`; a liveness check at `/healthz`. Each record carries source
+  attribution (`docker`, `docker:cname`, `docker:cf_tunnel`, …) so you can
+  see exactly which resolver path produced it. No AXFR, no polling, no
+  sidecar — the data is read straight from the plugin's own map.
 
 How To Build
 ------------
@@ -182,6 +190,7 @@ services:
     ports:
       - "53:53/udp"
       - "53:53/tcp"
+      - "8081:8081/tcp"   # inventory HTTP endpoint (drop if INVENTORY_ADDR is unset)
     volumes:
       # Docker: mount the Docker socket
       # - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -197,9 +206,17 @@ services:
       - CF_TARGET=infravm.homelab.net
       - CF_ZONE_DOMAIN=homelab.net
       - CF_ZONE_ID=your-cloudflare-zone-id
+      - INVENTORY_ADDR=:8081
       - FORWARD_DNS=1.1.1.1 8.8.8.8
       - CACHE_TTL=30
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+      - "8081:8081/tcp"   # inventory HTTP endpoint (optional)
 ```
+
+> Drop the `8081` mapping (or set `INVENTORY_ADDR=127.0.0.1:8081` inside the
+> container) if you don't want the endpoint reachable from the LAN.
 
 > **Note:** The container socket mount is required for container event discovery.
 > For **Docker**, use `/var/run/docker.sock`. For **Podman (rootful)**, use
@@ -230,6 +247,8 @@ services:
 | `CF_ZONE_ID` | *(none)* | Cloudflare zone ID (found on the zone Overview page) |
 | `CF_TUNNEL_ID` | *(none)* | Cloudflare Tunnel UUID. Enables per-container tunnel route management via `coredns.dockerdiscovery.cf_tunnel` label. |
 | `CF_ACCOUNT_ID` | *(none)* | Cloudflare Account ID. Required when `CF_TUNNEL_ID` is set. |
+| `INVENTORY_ADDR` | *(none)* | When set (e.g. `:8081` or `127.0.0.1:8081`), starts the inventory HTTP server. See [Inventory HTTP endpoint](#inventory-http-endpoint). |
+| `INVENTORY_PATH` | `/inventory` | Optional JSON path for the inventory server. HTML is served at `<path>.html`. |
 | `FORWARD_DNS` | `1.1.1.1 8.8.8.8` | Upstream DNS servers for non-matching queries |
 | `CACHE_TTL` | `30` | DNS cache duration in seconds |
 
@@ -314,6 +333,96 @@ Example
 Container will be resolved by label as `nginx.loc`:
 
     docker run --label=coredns.dockerdiscovery.host=nginx.loc nginx
+
+Inventory HTTP endpoint
+-----------------------
+
+The `inventory` directive (or the `INVENTORY_ADDR` env var) starts a tiny
+HTTP server that exposes the plugin's **live, in-memory** record table. It
+is scoped to this plugin only — there is no zone transfer, no polling, no
+sidecar, and no cross-plugin reflection. Each record carries source
+attribution (`docker`, `docker:cname`, `docker:cf_tunnel`, …) so you can
+see exactly which resolver path produced it.
+
+### Configuration
+
+Corefile:
+
+    docker {
+        domain docker.local
+        traefik_cname infravm.homelab.net
+        inventory :8081           # JSON at /inventory, HTML at /inventory.html
+        # inventory :8081 /things # custom JSON path; HTML at /things.html
+    }
+
+…or via env vars (the entrypoint generates the Corefile):
+
+    INVENTORY_ADDR=:8081
+    INVENTORY_PATH=/inventory   # optional; defaults to /inventory
+
+### Endpoints
+
+| Path                  | Content-Type       | Description                          |
+|-----------------------|--------------------|--------------------------------------|
+| `/inventory`          | `application/json` | Machine-readable record table        |
+| `/inventory.html`     | `text/html`        | Human-readable table                 |
+| `/healthz`            | `text/plain`       | Liveness check (always `ok`)         |
+
+If you customise the path with `inventory :8081 /things`, the JSON and HTML
+endpoints become `/things` and `/things.html` respectively (`/healthz` is
+unchanged).
+
+### JSON shape
+
+```json
+{
+  "generated_at": "2026-05-06T12:34:56Z",
+  "plugin": "docker",
+  "container_count": 3,
+  "record_count": 5,
+  "records": [
+    {
+      "domain": "app.example.com",
+      "kind": "CNAME",
+      "target": "infravm.homelab.net",
+      "container_id": "1a2b3c4d5e6f",
+      "container": "myapp",
+      "source": "docker:cname"
+    },
+    {
+      "domain": "myapp.docker.local",
+      "kind": "A",
+      "target": "172.17.0.5",
+      "container_id": "1a2b3c4d5e6f",
+      "container": "myapp",
+      "source": "docker"
+    }
+  ]
+}
+```
+
+`kind` is one of `A`, `AAAA`, `CNAME`, `TUNNEL`, or `A_TRAEFIK`. `source`
+mirrors the resolver path: `docker` for container-IP A/AAAA records,
+`docker:cname` for CNAME records (from `cname_target` or Traefik labels),
+and `docker:cf_tunnel` for entries served via a Cloudflare Tunnel route.
+
+### Quick checks
+
+    curl -s http://localhost:8081/inventory | jq '.records[] | select(.kind=="CNAME")'
+    curl -s http://localhost:8081/inventory | jq '.record_count'
+    curl -s http://localhost:8081/healthz
+
+Open `http://<host>:8081/inventory.html` in a browser for a sortable table
+view.
+
+### Security
+
+The endpoint exposes container names, internal IPs, and Cloudflare CNAME
+targets. Bind it to a loopback or management interface (`127.0.0.1:8081`,
+`INVENTORY_ADDR=127.0.0.1:8081`) when running on a multi-tenant host, and
+do not publish port 8081 to the internet. There is no built-in
+authentication; put it behind a reverse proxy with auth if you need to
+expose it remotely.
 
 CNAME Target (non-HTTP services)
 --------------------------------

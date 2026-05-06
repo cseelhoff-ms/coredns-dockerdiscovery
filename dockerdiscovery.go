@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/coredns/coredns/plugin"
 	"github.com/coredns/coredns/request"
@@ -60,6 +61,13 @@ type DockerDiscovery struct {
 	// label get tunnel ingress routes instead of DNS CNAME records.
 	tunnelSyncer *TunnelSyncer
 	tunnelConfig *TunnelConfig // set during config parsing, consumed at init
+
+	// Inventory HTTP endpoint. When inventoryAddr is non-empty, an HTTP
+	// server is started on plugin startup that exposes the live record
+	// table at inventoryPath (JSON) and inventoryPath+".html" (HTML).
+	inventoryAddr   string
+	inventoryPath   string
+	inventoryServer *InventoryServer
 }
 
 // NewDockerDiscovery constructs a new DockerDiscovery object
@@ -360,9 +368,27 @@ func (dd *DockerDiscovery) updateContainerInfo(container *dockerapi.Container) e
 
 		// Sync to Cloudflare: tunnel routes or DNS CNAME (mutually exclusive)
 		if dd.tunnelSyncer != nil && tunnelServiceURL != "" && len(cnameDomains) > 0 {
-			go dd.tunnelSyncer.AddRoutes(cnameDomains, tunnelServiceURL)
+			log.Printf("[docker] Dispatching tunnel sync for container %s: %d domain(s) -> %s", container.ID[:12], len(cnameDomains), tunnelServiceURL)
+			doms := append([]string(nil), cnameDomains...)
+			url := tunnelServiceURL
+			cid := container.ID[:12]
+			go func() {
+				log.Printf("[docker] tunnel sync START container=%s domains=%v", cid, doms)
+				dd.tunnelSyncer.AddRoutes(doms, url)
+				log.Printf("[docker] tunnel sync END container=%s", cid)
+			}()
 		} else if dd.cloudflareSyncer != nil && len(cnameDomains) > 0 {
-			go dd.cloudflareSyncer.SyncDomains(cnameDomains)
+			log.Printf("[docker] Dispatching cloudflare sync for container %s: %v", container.ID[:12], cnameDomains)
+			doms := append([]string(nil), cnameDomains...)
+			cid := container.ID[:12]
+			go func() {
+				log.Printf("[docker] cloudflare sync START container=%s domains=%v", cid, doms)
+				dd.cloudflareSyncer.SyncDomains(doms)
+				log.Printf("[docker] cloudflare sync END container=%s", cid)
+			}()
+		} else if len(cnameDomains) > 0 {
+			log.Printf("[docker] CNAME domains present but no syncer configured (tunnelSyncer=%v cloudflareSyncer=%v) container=%s domains=%v",
+				dd.tunnelSyncer != nil, dd.cloudflareSyncer != nil, container.ID[:12], cnameDomains)
 		}
 	} else if isExist {
 		log.Printf("[docker] Remove container entry %s (%s)", normalizeContainerName(container), container.ID[:12])
@@ -411,26 +437,144 @@ func (dd *DockerDiscovery) start() error {
 	}
 	log.Println("[docker] Successfully connected to Docker/Podman API")
 
+	// Initial container scan + periodic safety-net re-scan.
+	// The re-scan catches any events the listener missed (e.g. during a
+	// reconnect or if the daemon dropped events under load).
+	dd.scanAllContainers("startup")
+	go dd.periodicRescan()
+
+	// Heartbeat: confirms the plugin's main goroutine is alive and the
+	// listener loop is currently waiting for events. If you stop seeing
+	// these in the logs, the goroutine has exited.
+	go dd.heartbeat()
+
+	// Reconnect loop. AddEventListener can fail and the events channel
+	// can close at any time (daemon restart, socket replacement, network
+	// blip). Without this loop a single disconnect would leave CoreDNS
+	// running with no event processing until manually restarted.
+	backoff := time.Second
+	const maxBackoff = 30 * time.Second
+	for {
+		err := dd.runEventListener()
+		if err == nil {
+			// Channel closed cleanly — treat as a disconnect and reconnect.
+			err = errors.New("event channel closed")
+		}
+		log.Printf("[docker] Event listener exited: %s — reconnecting in %s", err, backoff)
+		time.Sleep(backoff)
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+
+		if pingErr := dd.dockerClient.Ping(); pingErr != nil {
+			log.Printf("[docker] Ping failed during reconnect: %s — will keep retrying", pingErr)
+			continue
+		}
+		// On a successful reconnect, do a full re-scan so we don't miss
+		// any containers that started during the outage.
+		dd.scanAllContainers("post-reconnect")
+		backoff = time.Second
+	}
+}
+
+// runEventListener registers an event listener and processes events
+// until the channel closes or registration fails. It returns the error
+// (or nil if the channel just closed).
+func (dd *DockerDiscovery) runEventListener() error {
 	events := make(chan *dockerapi.APIEvents)
 
 	if err := dd.dockerClient.AddEventListener(events); err != nil {
 		log.Printf("[docker] ERROR: Failed to add event listener: %s", err)
 		return err
 	}
-	log.Println("[docker] Event listener registered successfully")
+	log.Println("[docker] Event listener registered successfully — listening for events...")
 
+	// Best-effort cleanup on exit.
+	defer func() {
+		if err := dd.dockerClient.RemoveEventListener(events); err != nil {
+			log.Printf("[docker] RemoveEventListener: %s", err)
+		}
+	}()
+
+	for msg := range events {
+		dd.handleDockerEvent(msg)
+	}
+	return nil
+}
+
+// handleDockerEvent dispatches a single Docker/Podman event.
+func (dd *DockerDiscovery) handleDockerEvent(msg *dockerapi.APIEvents) {
+	go func(msg *dockerapi.APIEvents) {
+		event := fmt.Sprintf("%s:%s", msg.Type, msg.Action)
+		if msg.Action == "health_status" || strings.HasPrefix(msg.Action, "health_status:") {
+			return
+		}
+		log.Printf("[docker] Received event: %s (actor: %s)", event, shortID(msg.Actor.ID))
+		switch event {
+		case "container:start":
+			log.Println("[docker] New container spawned. Attempt to add A/AAAA records for it")
+
+			container, err := dd.dockerClient.InspectContainerWithOptions(dockerapi.InspectContainerOptions{ID: msg.Actor.ID})
+			if err != nil {
+				log.Printf("[docker] Event error %s #%s: %s", event, shortID(msg.Actor.ID), err)
+				return
+			}
+			if err := dd.updateContainerInfo(container); err != nil {
+				log.Printf("[docker] Error adding A/AAAA records for container %s: %s", shortID(container.ID), err)
+			}
+		case "container:die":
+			log.Println("[docker] Container being stopped. Attempt to remove its A/AAAA records from the DNS", shortID(msg.Actor.ID))
+			if err := dd.removeContainerInfo(msg.Actor.ID); err != nil {
+				log.Printf("[docker] Error deleting A/AAAA records for container: %s: %s", shortID(msg.Actor.ID), err)
+			}
+		case "network:connect":
+			// take a look https://gist.github.com/josefkarasek/be9bac36921f7bc9a61df23451594fbf for example of same event's types attributes
+			log.Printf("[docker] Container %s being connected to network %s.", shortID(msg.Actor.Attributes["container"]), msg.Actor.Attributes["name"])
+
+			container, err := dd.dockerClient.InspectContainerWithOptions(dockerapi.InspectContainerOptions{ID: msg.Actor.Attributes["container"]})
+			if err != nil {
+				log.Printf("[docker] Event error %s #%s: %s", event, shortID(msg.Actor.Attributes["container"]), err)
+				return
+			}
+			if err := dd.updateContainerInfo(container); err != nil {
+				log.Printf("[docker] Error adding A/AAAA records for container %s: %s", shortID(container.ID), err)
+			}
+		case "network:disconnect":
+			log.Printf("[docker] Container %s being disconnected from network %s", shortID(msg.Actor.Attributes["container"]), msg.Actor.Attributes["name"])
+
+			container, err := dd.dockerClient.InspectContainerWithOptions(dockerapi.InspectContainerOptions{ID: msg.Actor.Attributes["container"]})
+			if err != nil {
+				log.Printf("[docker] Event error %s #%s: %s", event, shortID(msg.Actor.Attributes["container"]), err)
+				return
+			}
+			if err := dd.updateContainerInfo(container); err != nil {
+				log.Printf("[docker] Error adding A/AAAA records for container %s: %s", shortID(container.ID), err)
+			}
+		}
+	}(msg)
+}
+
+// scanAllContainers lists every running container and (re)processes it.
+// Used at startup, after a reconnect, and on the periodic safety-net
+// timer so that any events missed by the listener still land in the map.
+func (dd *DockerDiscovery) scanAllContainers(reason string) {
 	containers, err := dd.dockerClient.ListContainers(dockerapi.ListContainersOptions{})
 	if err != nil {
-		log.Printf("[docker] ERROR: Failed to list containers: %s", err)
-		return err
+		log.Printf("[docker] scan(%s): ERROR listing containers: %s", reason, err)
+		return
 	}
-	log.Printf("[docker] Found %d running containers at startup", len(containers))
+	log.Printf("[docker] scan(%s): found %d running containers", reason, len(containers))
 
+	seen := make(map[string]bool, len(containers))
 	for _, apiContainer := range containers {
-		log.Printf("[docker] Inspecting container %s (names: %v)", apiContainer.ID[:12], apiContainer.Names)
+		seen[apiContainer.ID] = true
+		log.Printf("[docker] scan(%s): inspecting container %s (names: %v)", reason, apiContainer.ID[:12], apiContainer.Names)
 		container, err := dd.dockerClient.InspectContainerWithOptions(dockerapi.InspectContainerOptions{ID: apiContainer.ID})
 		if err != nil {
-			log.Printf("[docker] ERROR: Failed to inspect container %s: %s", apiContainer.ID[:12], err)
+			log.Printf("[docker] scan(%s): ERROR inspecting container %s: %s", reason, apiContainer.ID[:12], err)
 			continue
 		}
 
@@ -438,70 +582,57 @@ func (dd *DockerDiscovery) start() error {
 		if container.Config != nil {
 			for label, value := range container.Config.Labels {
 				if strings.HasPrefix(label, "traefik.") || strings.HasPrefix(label, "coredns.") {
-					log.Printf("[docker]   Label: %s = %s", label, value)
+					log.Printf("[docker] scan(%s):   Label: %s = %s", reason, label, value)
 				}
 			}
 		}
 
 		if err := dd.updateContainerInfo(container); err != nil {
-			log.Printf("[docker] Error adding A/AAAA records for container %s: %s\n", container.ID[:12], err)
+			log.Printf("[docker] scan(%s): error updating container %s: %s", reason, container.ID[:12], err)
 		}
 	}
 
-	log.Println("[docker] Startup container scan complete. Listening for events...")
-
-	for msg := range events {
-		go func(msg *dockerapi.APIEvents) {
-			event := fmt.Sprintf("%s:%s", msg.Type, msg.Action)
-			if msg.Action == "health_status" || strings.HasPrefix(msg.Action, "health_status:") {
-				return
-			}
-			log.Printf("[docker] Received event: %s (actor: %s)", event, shortID(msg.Actor.ID))
-			switch event {
-			case "container:start":
-				log.Println("[docker] New container spawned. Attempt to add A/AAAA records for it")
-
-				container, err := dd.dockerClient.InspectContainerWithOptions(dockerapi.InspectContainerOptions{ID: msg.Actor.ID})
-				if err != nil {
-					log.Printf("[docker] Event error %s #%s: %s", event, shortID(msg.Actor.ID), err)
-					return
-				}
-				if err := dd.updateContainerInfo(container); err != nil {
-					log.Printf("[docker] Error adding A/AAAA records for container %s: %s", shortID(container.ID), err)
-				}
-			case "container:die":
-				log.Println("[docker] Container being stopped. Attempt to remove its A/AAAA records from the DNS", shortID(msg.Actor.ID))
-				if err := dd.removeContainerInfo(msg.Actor.ID); err != nil {
-					log.Printf("[docker] Error deleting A/AAAA records for container: %s: %s", shortID(msg.Actor.ID), err)
-				}
-			case "network:connect":
-				// take a look https://gist.github.com/josefkarasek/be9bac36921f7bc9a61df23451594fbf for example of same event's types attributes
-				log.Printf("[docker] Container %s being connected to network %s.", shortID(msg.Actor.Attributes["container"]), msg.Actor.Attributes["name"])
-
-				container, err := dd.dockerClient.InspectContainerWithOptions(dockerapi.InspectContainerOptions{ID: msg.Actor.Attributes["container"]})
-				if err != nil {
-					log.Printf("[docker] Event error %s #%s: %s", event, shortID(msg.Actor.Attributes["container"]), err)
-					return
-				}
-				if err := dd.updateContainerInfo(container); err != nil {
-					log.Printf("[docker] Error adding A/AAAA records for container %s: %s", shortID(container.ID), err)
-				}
-			case "network:disconnect":
-				log.Printf("[docker] Container %s being disconnected from network %s", shortID(msg.Actor.Attributes["container"]), msg.Actor.Attributes["name"])
-
-				container, err := dd.dockerClient.InspectContainerWithOptions(dockerapi.InspectContainerOptions{ID: msg.Actor.Attributes["container"]})
-				if err != nil {
-					log.Printf("[docker] Event error %s #%s: %s", event, shortID(msg.Actor.Attributes["container"]), err)
-					return
-				}
-				if err := dd.updateContainerInfo(container); err != nil {
-					log.Printf("[docker] Error adding A/AAAA records for container %s: %s", shortID(container.ID), err)
-				}
-			}
-		}(msg)
+	// Drop entries for containers that disappeared while we weren't listening.
+	dd.mutex.RLock()
+	stale := make([]string, 0)
+	for id := range dd.containerInfoMap {
+		if !seen[id] {
+			stale = append(stale, id)
+		}
 	}
+	dd.mutex.RUnlock()
+	for _, id := range stale {
+		log.Printf("[docker] scan(%s): removing stale container entry %s", reason, shortID(id))
+		if err := dd.removeContainerInfo(id); err != nil {
+			log.Printf("[docker] scan(%s): error removing stale entry %s: %s", reason, shortID(id), err)
+		}
+	}
+	log.Printf("[docker] scan(%s): complete", reason)
+}
 
-	return errors.New("docker event loop closed")
+// periodicRescan re-scans all containers on a fixed interval as a
+// safety net for any events the listener missed.
+func (dd *DockerDiscovery) periodicRescan() {
+	const interval = 60 * time.Second
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for range t.C {
+		dd.scanAllContainers("periodic")
+	}
+}
+
+// heartbeat logs a line every minute summarising plugin state. If you
+// stop seeing these, the goroutine is dead.
+func (dd *DockerDiscovery) heartbeat() {
+	t := time.NewTicker(60 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		dd.mutex.RLock()
+		n := len(dd.containerInfoMap)
+		dd.mutex.RUnlock()
+		log.Printf("[docker] heartbeat: %d containers tracked, cloudflareSyncer=%v tunnelSyncer=%v",
+			n, dd.cloudflareSyncer != nil, dd.tunnelSyncer != nil)
+	}
 }
 
 // shortID safely truncates an ID string to at most 12 characters.

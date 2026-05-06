@@ -207,6 +207,15 @@ func createPlugin(c *caddy.Controller) (*DockerDiscovery, error) {
 					continue
 				}
 				dd.tunnelConfig.AccountID = c.Val()
+			case "inventory":
+				if !c.NextArg() || c.Val() == "" {
+					// Skip — INVENTORY_ADDR env var not set
+					continue
+				}
+				dd.inventoryAddr = c.Val()
+				if c.NextArg() && c.Val() != "" {
+					dd.inventoryPath = c.Val()
+				}
 			default:
 				return dd, c.Errf("unknown property: '%s'", c.Val())
 			}
@@ -317,6 +326,16 @@ func setup(c *caddy.Controller) error {
 	dd, err := createPlugin(c)
 	if err != nil {
 		return err
+	}
+
+	if dd.inventoryAddr != "" {
+		dd.inventoryServer = NewInventoryServer(dd.inventoryAddr, dd.inventoryPath, dd)
+		c.OnStartup(func() error {
+			return dd.inventoryServer.Start()
+		})
+		c.OnShutdown(func() error {
+			return dd.inventoryServer.Stop()
+		})
 	}
 
 	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {

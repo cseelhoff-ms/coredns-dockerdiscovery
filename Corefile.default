@@ -9,6 +9,7 @@
         cf_token {$CF_TOKEN}
         cf_target {$CF_TARGET}
         cf_zone {$CF_ZONE_DOMAIN} {$CF_ZONE_ID}
+        inventory {$INVENTORY_ADDR}
     }
     forward . {$FORWARD_DNS1} {$FORWARD_DNS2}
     log
