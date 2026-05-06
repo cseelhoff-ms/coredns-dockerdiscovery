@@ -32,11 +32,9 @@ import (
 type RecordKind string
 
 const (
-	RecordKindA        RecordKind = "A"
-	RecordKindAAAA     RecordKind = "AAAA"
-	RecordKindCNAME    RecordKind = "CNAME"
-	RecordKindTunnel   RecordKind = "TUNNEL"
-	RecordKindTraefikA RecordKind = "A_TRAEFIK"
+	RecordKindCNAME  RecordKind = "CNAME"
+	RecordKindHostA  RecordKind = "A_HOST"
+	RecordKindTunnel RecordKind = "TUNNEL"
 )
 
 // InventoryRecord is one logical DNS record served by this plugin.
@@ -70,81 +68,54 @@ func (dd *DockerDiscovery) Snapshot() InventorySnapshot {
 		ContainerCount: len(dd.containerInfoMap),
 	}
 
+	tunnelSet := make(map[string]bool)
+
 	for id, ci := range dd.containerInfoMap {
 		name := ""
 		if ci.container != nil {
 			name = normalizeContainerName(ci.container)
 		}
 
-		// A records (container IPs) — emitted only for plain `domains`
-		// (these are skipped upstream when the container has no IP).
-		if ci.address != nil {
-			for _, d := range ci.domains {
-				snap.Records = append(snap.Records, InventoryRecord{
-					Domain:      d,
-					Kind:        RecordKindA,
-					Target:      ci.address.String(),
-					ContainerID: shortID(id),
-					Container:   name,
-					Source:      "docker",
-				})
-			}
-		}
-		if ci.address6 != nil {
-			for _, d := range ci.domains {
-				snap.Records = append(snap.Records, InventoryRecord{
-					Domain:      d,
-					Kind:        RecordKindAAAA,
-					Target:      ci.address6.String(),
-					ContainerID: shortID(id),
-					Container:   name,
-					Source:      "docker",
-				})
-			}
+		// Host-A record (single per container, when host_ip is set).
+		if ci.hostADomain != "" && dd.hostIP != nil {
+			snap.Records = append(snap.Records, InventoryRecord{
+				Domain:      ci.hostADomain,
+				Kind:        RecordKindHostA,
+				Target:      dd.hostIP.String(),
+				ContainerID: shortID(id),
+				Container:   name,
+				Source:      "docker:host_a",
+			})
 		}
 
-		// CNAME / Tunnel / traefik_a records (from traefik or cname_target labels).
+		// Track which domains have a tunnel entry so we can join with
+		// the CNAME emission below (same domain may carry both kinds).
+		for _, d := range ci.tunnelDomains {
+			tunnelSet[d] = true
+			snap.Records = append(snap.Records, InventoryRecord{
+				Domain:      d,
+				Kind:        RecordKindTunnel,
+				Target:      dd.cfTunnelTarget,
+				ContainerID: shortID(id),
+				Container:   name,
+				Source:      "docker:tunnel",
+			})
+		}
+
+		// CNAME records for Traefik FQDNs. Suppressed when the same
+		// domain is served as host-A locally — A wins for LAN clients.
 		for _, d := range ci.cnameDomains {
-			switch {
-			case ci.tunnelServiceURL != "" && dd.tunnelSyncer != nil:
-				snap.Records = append(snap.Records, InventoryRecord{
-					Domain:      d,
-					Kind:        RecordKindTunnel,
-					Target:      ci.tunnelServiceURL,
-					ContainerID: shortID(id),
-					Container:   name,
-					Source:      "docker:cf_tunnel",
-				})
-			case dd.traefikCNAME != "":
-				snap.Records = append(snap.Records, InventoryRecord{
-					Domain:      d,
-					Kind:        RecordKindCNAME,
-					Target:      dd.traefikCNAME,
-					ContainerID: shortID(id),
-					Container:   name,
-					Source:      "docker:cname",
-				})
-			case dd.traefikA != nil:
-				snap.Records = append(snap.Records, InventoryRecord{
-					Domain:      d,
-					Kind:        RecordKindTraefikA,
-					Target:      dd.traefikA.String(),
-					ContainerID: shortID(id),
-					Container:   name,
-					Source:      "docker:traefik_a",
-				})
-			default:
-				// CNAME label with no target configured — still report it
-				// so the operator can see the domain is being tracked.
-				snap.Records = append(snap.Records, InventoryRecord{
-					Domain:      d,
-					Kind:        RecordKindCNAME,
-					Target:      "",
-					ContainerID: shortID(id),
-					Container:   name,
-					Source:      "docker:cname",
-				})
+			if strings.EqualFold(d, ci.hostADomain) {
+				continue
 			}
+			snap.Records = append(snap.Records, InventoryRecord{
+				Domain:      d,
+				Kind:        RecordKindCNAME,
+				Target:      dd.traefikCNAME,
+				ContainerID: shortID(id),
+				Container:   name,
+				Source:      "docker:cname",
+			})
 		}
 	}
 
@@ -188,6 +159,17 @@ func (s *InventoryServer) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc(s.path, s.handleJSON)
 	mux.HandleFunc(s.path+".html", s.handleHTML)
+	// Serve the HTML report at "/" so the inventory has a short URL
+	// (e.g. https://dns.177cpt.com/). Anything that isn't an exact
+	// match for "/" falls through to a 404 — we don't want this to
+	// shadow other registered paths.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		s.handleHTML(w, r)
+	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))

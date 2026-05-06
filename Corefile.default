@@ -1,14 +1,15 @@
 .:53 {
     hosts {
-        {$TRAEFIK_IP} {$TRAEFIK_HOST}
+        {$HOST_IP} {$TRAEFIK_CNAME}
         fallthrough
     }
     docker {$DOCKER_ENDPOINT} {
-        domain {$DOCKER_DOMAIN}
-        traefik_cname {$TRAEFIK_HOST}
+        traefik_cname {$TRAEFIK_CNAME}
+        host_ip {$HOST_IP}
         cf_token {$CF_TOKEN}
-        cf_target {$CF_TARGET}
-        cf_zone {$CF_ZONE_DOMAIN} {$CF_ZONE_ID}
+        cf_tunnel_id {$CF_TUNNEL_ID}
+        cf_account_id {$CF_ACCOUNT_ID}
+        cf_tunnel_target {$CF_TUNNEL_TARGET}
         inventory {$INVENTORY_ADDR}
     }
     forward . {$FORWARD_DNS1} {$FORWARD_DNS2}

@@ -1,7 +1,6 @@
 package dockerdiscovery
 
 import (
-	"fmt"
 	"log"
 	"regexp"
 	"strings"
@@ -9,100 +8,37 @@ import (
 	dockerapi "github.com/fsouza/go-dockerclient"
 )
 
+// normalizeContainerName trims the leading slash that the Docker API
+// adds to container names.
 func normalizeContainerName(container *dockerapi.Container) string {
 	return strings.TrimLeft(container.Name, "/")
 }
 
-// resolvers implements ContainerDomainResolver
-
-type SubDomainContainerNameResolver struct {
-	domain string
-}
-
-func (resolver SubDomainContainerNameResolver) resolve(container *dockerapi.Container) ([]string, error) {
-	var domains []string
-	domains = append(domains, fmt.Sprintf("%s.%s", normalizeContainerName(container), resolver.domain))
-	return domains, nil
-}
-
-type SubDomainHostResolver struct {
-	domain string
-}
-
-func (resolver SubDomainHostResolver) resolve(container *dockerapi.Container) ([]string, error) {
-	var domains []string
-	domains = append(domains, fmt.Sprintf("%s.%s", container.Config.Hostname, resolver.domain))
-	return domains, nil
-}
-
+// LabelResolver returns the value of a single Docker label as a domain.
+// Used by the host_ip flow to read `coredns.dockerdiscovery.host`.
 type LabelResolver struct {
 	hostLabel string
 }
 
 func (resolver LabelResolver) resolve(container *dockerapi.Container) ([]string, error) {
 	var domains []string
-
-	for label, value := range container.Config.Labels {
-		if label == resolver.hostLabel {
-			domains = append(domains, value)
-			break
-		}
-	}
-
-	return domains, nil
-}
-
-// ComposeResolver sets names based on compose labels
-type ComposeResolver struct {
-	domain string
-}
-
-func (resolver ComposeResolver) resolve(container *dockerapi.Container) ([]string, error) {
-	var domains []string
-
-	project, pok := container.Config.Labels["com.docker.compose.project"]
-	service, sok := container.Config.Labels["com.docker.compose.service"]
-	if !pok || !sok {
+	if container.Config == nil {
 		return domains, nil
 	}
-
-	domain := fmt.Sprintf("%s.%s.%s", service, project, resolver.domain)
-	domains = append(domains, domain)
-
-	log.Printf("[docker] Found compose domain for container %s: %s", container.ID[:12], domain)
-	return domains, nil
-}
-
-type NetworkAliasesResolver struct {
-	network string
-}
-
-func (resolver NetworkAliasesResolver) resolve(container *dockerapi.Container) ([]string, error) {
-	var domains []string
-
-	if resolver.network != "" {
-		network, ok := container.NetworkSettings.Networks[resolver.network]
-		if ok {
-			domains = append(domains, network.Aliases...)
-		}
-	} else {
-		for _, network := range container.NetworkSettings.Networks {
-			domains = append(domains, network.Aliases...)
-		}
+	if value, ok := container.Config.Labels[resolver.hostLabel]; ok && value != "" {
+		domains = append(domains, value)
 	}
-
 	return domains, nil
 }
 
 // TraefikLabelResolver extracts hostnames from Traefik Docker labels.
-// It looks for labels matching traefik.http.routers.*.rule and extracts
-// Host() and HostSNI() values, similar to how coredns-traefik parses
-// Traefik's API response.
+// It looks for labels matching traefik.http.routers.*.rule and
+// traefik.tcp.routers.*.rule, then pulls Host()/HostSNI() values.
 type TraefikLabelResolver struct {
 	hostMatcher *regexp.Regexp
 }
 
-// traefikHostMatcher matches Host(`example.com`) and HostSNI(`example.com`) patterns
+// traefikHostMatcher matches Host(`example.com`) and HostSNI(`example.com`)
 var traefikHostMatcher = regexp.MustCompile("Host(?:SNI)?\\(`([^`]+)`\\)")
 
 func NewTraefikLabelResolver() *TraefikLabelResolver {
@@ -113,6 +49,9 @@ func NewTraefikLabelResolver() *TraefikLabelResolver {
 
 func (resolver TraefikLabelResolver) resolve(container *dockerapi.Container) ([]string, error) {
 	var domains []string
+	if container.Config == nil {
+		return domains, nil
+	}
 	seen := make(map[string]bool)
 
 	for label, value := range container.Config.Labels {
@@ -127,7 +66,7 @@ func (resolver TraefikLabelResolver) resolve(container *dockerapi.Container) ([]
 				if !seen[host] {
 					seen[host] = true
 					domains = append(domains, host)
-					log.Printf("[docker] Found traefik host for container %s: %s", container.ID[:12], host)
+					log.Printf("[docker] Found traefik host for container %s: %s", shortID(container.ID), host)
 				}
 			}
 		}
@@ -136,22 +75,12 @@ func (resolver TraefikLabelResolver) resolve(container *dockerapi.Container) ([]
 	return domains, nil
 }
 
-// isTraefikRouterRule checks if a Docker label is a Traefik HTTP router rule.
-// Matches labels like: traefik.http.routers.<name>.rule
+// isTraefikRouterRule matches `traefik.http.routers.<name>.rule` and
+// `traefik.tcp.routers.<name>.rule`.
 func isTraefikRouterRule(label string) bool {
-	return strings.HasPrefix(label, "traefik.http.routers.") && strings.HasSuffix(label, ".rule")
-}
-
-// getTraefikServicePort scans container labels for a Traefik service port
-// definition (traefik.http.services.*.loadbalancer.server.port) and returns
-// the port value, or empty string if not found.
-func getTraefikServicePort(labels map[string]string) string {
-	for label, value := range labels {
-		if strings.HasPrefix(label, "traefik.http.services.") &&
-			strings.HasSuffix(label, ".loadbalancer.server.port") &&
-			value != "" {
-			return value
-		}
+	if !strings.HasSuffix(label, ".rule") {
+		return false
 	}
-	return ""
+	return strings.HasPrefix(label, "traefik.http.routers.") ||
+		strings.HasPrefix(label, "traefik.tcp.routers.")
 }

@@ -25,23 +25,12 @@ type TunnelSyncer struct {
 
 // NewTunnelSyncer creates a TunnelSyncer with a real Cloudflare API client.
 func NewTunnelSyncer(tunnelCfg *TunnelConfig, cfCfg *CloudflareConfig) (*TunnelSyncer, error) {
-	var api *cloudflare.API
-	var err error
-
-	if cfCfg.APIToken != "" {
-		api, err = cloudflare.NewWithAPIToken(cfCfg.APIToken)
-	} else if cfCfg.APIKey != "" && cfCfg.APIEmail != "" {
-		api, err = cloudflare.New(cfCfg.APIKey, cfCfg.APIEmail)
-	} else {
-		return nil, fmt.Errorf("tunnel: either cf_token or both cf_email and cf_key must be provided")
-	}
-
+	api, err := newCloudflareAPI(cfCfg)
 	if err != nil {
-		return nil, fmt.Errorf("tunnel: failed to create API client: %w", err)
+		return nil, fmt.Errorf("tunnel: %w", err)
 	}
-
 	return &TunnelSyncer{
-		api:    &cloudflareAPIWrapper{api: api},
+		api:    api,
 		tunnel: tunnelCfg,
 		cf:     cfCfg,
 	}, nil

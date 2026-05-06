@@ -2,9 +2,7 @@ package dockerdiscovery
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -18,7 +16,7 @@ import (
 func TestInventoryDirectiveParsing(t *testing.T) {
 	t.Run("addr only, default path", func(t *testing.T) {
 		c := caddy.NewTestController("dns", `docker {
-	domain docker.loc
+	traefik_cname traefik.example.com
 	inventory 127.0.0.1:18181
 }`)
 		dd, err := createPlugin(c)
@@ -29,7 +27,7 @@ func TestInventoryDirectiveParsing(t *testing.T) {
 
 	t.Run("addr + custom path", func(t *testing.T) {
 		c := caddy.NewTestController("dns", `docker {
-	domain docker.loc
+	traefik_cname traefik.example.com
 	inventory 127.0.0.1:18182 /things
 }`)
 		dd, err := createPlugin(c)
@@ -38,9 +36,9 @@ func TestInventoryDirectiveParsing(t *testing.T) {
 		assert.Equal(t, "/things", dd.inventoryPath)
 	})
 
-	t.Run("empty arg is silently skipped", func(t *testing.T) {
+	t.Run("empty arg silently skipped", func(t *testing.T) {
 		c := caddy.NewTestController("dns", `docker {
-	domain docker.loc
+	traefik_cname traefik.example.com
 	inventory ""
 }`)
 		dd, err := createPlugin(c)
@@ -51,45 +49,59 @@ func TestInventoryDirectiveParsing(t *testing.T) {
 
 func TestInventorySnapshot(t *testing.T) {
 	c := caddy.NewTestController("dns", `docker {
-	domain docker.loc
-	traefik_cname host.example.com
+	traefik_cname traefik.example.com
+	host_ip 10.0.60.3
 }`)
 	dd, err := createPlugin(c)
 	assert.Nil(t, err)
 
-	addr := net.ParseIP("10.0.0.42")
-	container := genContainerDefn(addr.String(), "bridge", addr.String())
-	// Add a traefik label so a CNAME entry appears.
-	container.Config.Labels["traefik.http.routers.app.rule"] = "Host(`app.example.com`)"
+	// portainer-like: Traefik label only → CNAME row.
+	portainer := genContainer("aa00", "portainer", map[string]string{
+		"traefik.http.routers.portainer.rule": "Host(`portainer.example.com`)",
+	})
+	assert.Nil(t, dd.updateContainerInfo(portainer))
 
-	assert.Nil(t, dd.updateContainerInfo(container))
+	// openldap-like: host label only → A_HOST row.
+	openldap := genContainer("bb00", "openldap", map[string]string{
+		"coredns.dockerdiscovery.host": "ldap.example.com",
+	})
+	assert.Nil(t, dd.updateContainerInfo(openldap))
+
+	// traefik-like: both labels for the same FQDN → A_HOST only (CNAME suppressed).
+	traefik := genContainer("cc00", "traefik", map[string]string{
+		"coredns.dockerdiscovery.host":        "traefik.example.com",
+		"traefik.http.routers.dashboard.rule": "Host(`traefik.example.com`)",
+	})
+	assert.Nil(t, dd.updateContainerInfo(traefik))
 
 	snap := dd.Snapshot()
 	assert.Equal(t, "docker", snap.Plugin)
-	assert.Equal(t, 1, snap.ContainerCount)
-	assert.Greater(t, snap.RecordCount, 0)
+	assert.Equal(t, 3, snap.ContainerCount)
 
-	var sawA, sawCNAME bool
+	kinds := map[string][]InventoryRecord{}
 	for _, rec := range snap.Records {
-		switch rec.Kind {
-		case RecordKindA:
-			sawA = true
-			assert.Equal(t, addr.String(), rec.Target)
-			assert.Equal(t, "docker", rec.Source)
-		case RecordKindCNAME:
-			sawCNAME = true
-			assert.Equal(t, "host.example.com", rec.Target)
-			assert.Equal(t, "app.example.com", rec.Domain)
-			assert.Equal(t, "docker:cname", rec.Source)
-		}
+		kinds[string(rec.Kind)] = append(kinds[string(rec.Kind)], rec)
 	}
-	assert.True(t, sawA, "expected an A record in snapshot")
-	assert.True(t, sawCNAME, "expected a CNAME record in snapshot")
+
+	// Expect exactly: 1× CNAME (portainer), 2× A_HOST (openldap, traefik).
+	assert.Len(t, kinds[string(RecordKindCNAME)], 1)
+	assert.Equal(t, "portainer.example.com", kinds[string(RecordKindCNAME)][0].Domain)
+	assert.Equal(t, "traefik.example.com", kinds[string(RecordKindCNAME)][0].Target)
+
+	assert.Len(t, kinds[string(RecordKindHostA)], 2)
+	hostADomains := []string{kinds[string(RecordKindHostA)][0].Domain, kinds[string(RecordKindHostA)][1].Domain}
+	assert.ElementsMatch(t, []string{"ldap.example.com", "traefik.example.com"}, hostADomains)
+	for _, rec := range kinds[string(RecordKindHostA)] {
+		assert.Equal(t, "10.0.60.3", rec.Target)
+		assert.Equal(t, "docker:host_a", rec.Source)
+	}
+
+	// No tunnel rows because cf_tunnel_target / tunnelSyncer aren't configured.
+	assert.Len(t, kinds[string(RecordKindTunnel)], 0)
 }
 
-// Ensure the snapshot is safe to call when nothing has been registered.
 func TestInventorySnapshotEmpty(t *testing.T) {
-	c := caddy.NewTestController("dns", `docker { domain docker.loc }`)
+	c := caddy.NewTestController("dns", `docker { traefik_cname x.example.com }`)
 	dd, err := createPlugin(c)
 	assert.Nil(t, err)
 
@@ -100,15 +112,18 @@ func TestInventorySnapshotEmpty(t *testing.T) {
 }
 
 func TestInventoryServerJSONAndHTML(t *testing.T) {
-	c := caddy.NewTestController("dns", `docker { domain docker.loc }`)
+	c := caddy.NewTestController("dns", `docker {
+	traefik_cname traefik.example.com
+	host_ip 10.0.0.7
+}`)
 	dd, err := createPlugin(c)
 	assert.Nil(t, err)
 
-	addr := net.ParseIP("10.0.0.7")
-	container := genContainerDefn(addr.String(), "bridge", addr.String())
-	assert.Nil(t, dd.updateContainerInfo(container))
+	cont := genContainer("ddee", "myhost", map[string]string{
+		"coredns.dockerdiscovery.host": "myhost.example.com",
+	})
+	assert.Nil(t, dd.updateContainerInfo(cont))
 
-	// Bind an ephemeral port to avoid conflicts.
 	srv := NewInventoryServer("127.0.0.1:0", "", dd)
 	assert.Nil(t, srv.Start())
 	defer srv.Stop()
@@ -116,7 +131,6 @@ func TestInventoryServerJSONAndHTML(t *testing.T) {
 	base := "http://" + srv.ln.Addr().String()
 	httpc := &http.Client{Timeout: 2 * time.Second}
 
-	// JSON
 	resp, err := httpc.Get(base + "/inventory")
 	assert.Nil(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -128,7 +142,6 @@ func TestInventoryServerJSONAndHTML(t *testing.T) {
 	assert.Equal(t, 1, snap.ContainerCount)
 	assert.Greater(t, snap.RecordCount, 0)
 
-	// HTML
 	resp, err = httpc.Get(base + "/inventory.html")
 	assert.Nil(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -137,39 +150,32 @@ func TestInventoryServerJSONAndHTML(t *testing.T) {
 	assert.True(t, strings.Contains(string(body), "<table"))
 	assert.True(t, strings.Contains(string(body), "10.0.0.7"))
 
-	// Health
 	resp, err = httpc.Get(base + "/healthz")
 	assert.Nil(t, err)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	resp.Body.Close()
 }
 
-// Sanity: bind error surfaces synchronously so misconfigurations don't
-// silently leave the endpoint missing.
 func TestInventoryServerBindError(t *testing.T) {
-	c := caddy.NewTestController("dns", `docker { domain docker.loc }`)
+	c := caddy.NewTestController("dns", `docker { traefik_cname x.example.com }`)
 	dd, _ := createPlugin(c)
 	first := NewInventoryServer("127.0.0.1:0", "", dd)
 	assert.Nil(t, first.Start())
 	defer first.Stop()
 
-	// Reuse the exact bound address — second Start should fail.
 	second := NewInventoryServer(first.ln.Addr().String(), "", dd)
 	err := second.Start()
 	assert.NotNil(t, err)
 	assert.True(t, strings.Contains(err.Error(), "inventory: listen"))
 }
 
-// Ensure we cleanly serve no records (and don't panic) when a container
-// has only CNAME labels but no resolvable IP.
-func TestInventorySnapshotCNAMEOnly(t *testing.T) {
-	c := caddy.NewTestController("dns", `docker {
-	traefik_cname tunnel.example.com
-}`)
+// CNAME-only container (no host label, no host_ip) — still produces a CNAME row.
+func TestInventoryCNAMEOnlyContainer(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker { traefik_cname tunnel.example.com }`)
 	dd, err := createPlugin(c)
 	assert.Nil(t, err)
 
-	container := &dockerapi.Container{
+	cont := &dockerapi.Container{
 		ID:   "abcdef0123456789",
 		Name: "lonely",
 		Config: &dockerapi.Config{
@@ -180,15 +186,10 @@ func TestInventorySnapshotCNAMEOnly(t *testing.T) {
 		HostConfig:      &dockerapi.HostConfig{NetworkMode: "host"},
 		NetworkSettings: &dockerapi.NetworkSettings{Networks: map[string]dockerapi.ContainerNetwork{}},
 	}
-
-	assert.Nil(t, dd.updateContainerInfo(container))
+	assert.Nil(t, dd.updateContainerInfo(cont))
 
 	snap := dd.Snapshot()
-	if !assert.Equal(t, 1, snap.RecordCount) {
-		for _, r := range snap.Records {
-			fmt.Println(r)
-		}
-	}
+	assert.Equal(t, 1, snap.RecordCount)
 	assert.Equal(t, RecordKindCNAME, snap.Records[0].Kind)
 	assert.Equal(t, "tunnel.example.com", snap.Records[0].Target)
 }

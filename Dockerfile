@@ -21,7 +21,10 @@ RUN sed -i "s/^#.*//g; /^$/d; /^hosts:hosts$/i docker:dockerdiscovery" plugin.cf
     && strip -vs /usr/local/bin/coredns
 
 FROM alpine:${ALPINE_VERS}
-RUN apk --no-cache add ca-certificates
+# ca-certificates: TLS to Cloudflare/Docker APIs
+# iproute2 (ss), curl, netcat-openbsd (nc): for `docker exec` debugging of the
+# inventory HTTP endpoint — see README "Debugging the endpoint".
+RUN apk --no-cache add ca-certificates iproute2 curl netcat-openbsd bash
 COPY --from=0 /usr/local/bin/coredns /usr/local/bin/coredns
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

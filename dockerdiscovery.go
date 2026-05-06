@@ -16,61 +16,67 @@ import (
 	"github.com/miekg/dns"
 )
 
+// ContainerInfo is the per-container record set.
+//
+// hostADomain (singular) is set when the container carries the
+// `coredns.dockerdiscovery.host` label AND `host_ip` is configured on the
+// plugin. The A record always points at `dd.hostIP`, never the container's
+// internal network IP — that's the whole point of the host_ip mode (the
+// service is published on the LAN-facing host port).
+//
+// cnameDomains is the set of FQDNs extracted from Traefik router rules
+// (Host()/HostSNI()). They produce CNAME records pointing at
+// `dd.traefikCNAME` and, when the tunnel syncer is configured, also
+// produce Cloudflare Tunnel ingress entries pointing at `dd.cfTunnelTarget`.
+//
+// When the same FQDN appears in BOTH sets, the A record wins locally
+// (LAN clients hit the host directly) and the tunnel entry still emits
+// (public clients reach the same hostname via Cloudflare).
 type ContainerInfo struct {
-	container        *dockerapi.Container
-	address          net.IP
-	address6         net.IP
-	domains          []string // resolved domains (A/AAAA records)
-	cnameDomains     []string // domains resolved via traefik labels (CNAME records)
-	tunnelServiceURL string   // if set, use tunnel routes instead of DNS CNAME
+	container     *dockerapi.Container
+	hostADomain   string   // FQDN to serve as A → dd.hostIP (optional)
+	cnameDomains  []string // FQDNs to serve as CNAME → dd.traefikCNAME (Traefik labels)
+	tunnelDomains []string // FQDNs synced to the Cloudflare Tunnel (subset of cnameDomains, minus excludes)
 }
 
+// ContainerInfoMap is the keyed by Docker container ID.
 type ContainerInfoMap map[string]*ContainerInfo
 
-type ContainerDomainResolver interface {
-	// return domains without trailing dot
-	resolve(container *dockerapi.Container) ([]string, error)
-}
-
-// DockerDiscovery is a plugin that conforms to the coredns plugin interface
+// DockerDiscovery is a CoreDNS plugin that synthesises records from
+// running Docker/Podman containers and (optionally) syncs Cloudflare
+// Tunnel ingress rules for those records.
 type DockerDiscovery struct {
 	Next           plugin.Handler
 	dockerEndpoint string
-	resolvers      []ContainerDomainResolver
 	dockerClient   *dockerapi.Client
 
 	mutex            sync.RWMutex
 	containerInfoMap ContainerInfoMap
 	ttl              uint32
 
-	// Resolvers whose results produce CNAME records (e.g. cname_target, traefik labels).
-	cnameResolvers []ContainerDomainResolver
+	// host_ip mode
+	hostIP       net.IP         // LAN-facing host IP, e.g. 10.0.60.3
+	hostResolver *LabelResolver // reads coredns.dockerdiscovery.host
 
-	// Traefik label support: when set, domains from TraefikLabelResolver
-	// produce CNAME or A records pointing to the configured target.
+	// Traefik label mode
 	traefikResolver *TraefikLabelResolver
-	traefikCNAME    string // CNAME target for traefik-discovered hosts
-	traefikA        net.IP // A record target for traefik-discovered hosts
+	traefikCNAME    string // CNAME target served for Traefik FQDNs
 
-	// Cloudflare DNS sync: when configured, CNAME records are synced
-	// to Cloudflare whenever containers start/stop.
-	cloudflareSyncer *CloudflareSyncer
-	cloudflareConfig *CloudflareConfig // set during config parsing, consumed at init
+	// Cloudflare credentials/exclude — used solely by the tunnel syncer.
+	cloudflareConfig *CloudflareConfig
 
-	// Cloudflare Tunnel: when configured, containers with the cf_tunnel
-	// label get tunnel ingress routes instead of DNS CNAME records.
-	tunnelSyncer *TunnelSyncer
-	tunnelConfig *TunnelConfig // set during config parsing, consumed at init
+	// Cloudflare Tunnel ingress sync
+	tunnelSyncer   *TunnelSyncer
+	tunnelConfig   *TunnelConfig
+	cfTunnelTarget string // backend service URL pushed for every Traefik FQDN
 
-	// Inventory HTTP endpoint. When inventoryAddr is non-empty, an HTTP
-	// server is started on plugin startup that exposes the live record
-	// table at inventoryPath (JSON) and inventoryPath+".html" (HTML).
+	// Inventory HTTP endpoint
 	inventoryAddr   string
 	inventoryPath   string
 	inventoryServer *InventoryServer
 }
 
-// NewDockerDiscovery constructs a new DockerDiscovery object
+// NewDockerDiscovery constructs a DockerDiscovery with sensible defaults.
 func NewDockerDiscovery(dockerEndpoint string) *DockerDiscovery {
 	return &DockerDiscovery{
 		dockerEndpoint:   dockerEndpoint,
@@ -79,66 +85,54 @@ func NewDockerDiscovery(dockerEndpoint string) *DockerDiscovery {
 	}
 }
 
-func (dd *DockerDiscovery) resolveDomainsByContainer(container *dockerapi.Container) ([]string, []string, error) {
-	var domains []string
+// resolveDomainsByContainer extracts the per-container domain sets:
+// one optional A-record FQDN and a slice of CNAME FQDNs.
+func (dd *DockerDiscovery) resolveDomainsByContainer(container *dockerapi.Container) (string, []string) {
+	var hostADomain string
+
+	if dd.hostResolver != nil && dd.hostIP != nil {
+		if doms, err := dd.hostResolver.resolve(container); err == nil && len(doms) > 0 {
+			hostADomain = strings.ToLower(strings.TrimSpace(doms[0]))
+		}
+	}
+
 	var cnameDomains []string
-	for _, resolver := range dd.resolvers {
-		var d, err = resolver.resolve(container)
-		if err != nil {
-			log.Printf("[docker] Error resolving container domains %s", err)
-		}
-		domains = append(domains, d...)
-	}
-
-	// Resolve CNAME label domains
-	for _, resolver := range dd.cnameResolvers {
-		d, err := resolver.resolve(container)
-		if err != nil {
-			log.Printf("[docker] Error resolving cname label domains %s", err)
-		}
-		cnameDomains = append(cnameDomains, d...)
-	}
-
-	// Resolve traefik label domains separately
 	if dd.traefikResolver != nil {
-		d, err := dd.traefikResolver.resolve(container)
-		if err != nil {
-			log.Printf("[docker] Error resolving traefik label domains %s", err)
+		if doms, err := dd.traefikResolver.resolve(container); err == nil {
+			cnameDomains = doms
 		}
-		cnameDomains = append(cnameDomains, d...)
 	}
 
-	return domains, cnameDomains, nil
+	return hostADomain, cnameDomains
 }
 
-// DomainLookupResult holds the result of a domain lookup with record type info
+// DomainLookupResult carries a matched container plus the kind of record
+// the caller should emit.
 type DomainLookupResult struct {
 	containerInfo *ContainerInfo
-	isCNAME       bool // true if this domain should return CNAME/traefik-A records
+	isCNAME       bool // true → emit CNAME → dd.traefikCNAME; false → emit A → dd.hostIP
 }
 
+// containerInfoByDomain finds the container responsible for the given
+// query name. Host-A records win over CNAMEs for the same FQDN.
 func (dd *DockerDiscovery) containerInfoByDomain(requestName string) (*DomainLookupResult, error) {
 	dd.mutex.RLock()
 	defer dd.mutex.RUnlock()
 
-	// Check CNAME domains first — they take priority over auto-generated
-	// A record domains (e.g. from the domain directive). This prevents
-	// container-name-based A records from shadowing explicit CNAME entries.
-	// Example: container_name "traefik" + domain "177cpt.com" would create
-	// an A record for traefik.177cpt.com pointing to the container IP,
-	// shadowing the intended CNAME from traefik_cname.
-	for _, containerInfo := range dd.containerInfoMap {
-		for _, d := range containerInfo.cnameDomains {
-			if fmt.Sprintf("%s.", d) == requestName {
-				return &DomainLookupResult{containerInfo: containerInfo, isCNAME: true}, nil
-			}
+	target := strings.ToLower(strings.TrimSuffix(requestName, "."))
+
+	// Host-A wins.
+	for _, ci := range dd.containerInfoMap {
+		if ci.hostADomain != "" && strings.EqualFold(ci.hostADomain, target) {
+			return &DomainLookupResult{containerInfo: ci, isCNAME: false}, nil
 		}
 	}
 
-	for _, containerInfo := range dd.containerInfoMap {
-		for _, d := range containerInfo.domains {
-			if fmt.Sprintf("%s.", d) == requestName {
-				return &DomainLookupResult{containerInfo: containerInfo, isCNAME: false}, nil
+	// Otherwise look for a CNAME match.
+	for _, ci := range dd.containerInfoMap {
+		for _, d := range ci.cnameDomains {
+			if strings.EqualFold(d, target) {
+				return &DomainLookupResult{containerInfo: ci, isCNAME: true}, nil
 			}
 		}
 	}
@@ -146,54 +140,40 @@ func (dd *DockerDiscovery) containerInfoByDomain(requestName string) (*DomainLoo
 	return nil, nil
 }
 
-// ServeDNS implements plugin.Handler
+// ServeDNS implements plugin.Handler.
 func (dd *DockerDiscovery) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 	state := request.Request{W: w, Req: r}
 	var answers []dns.RR
+
 	switch state.QType() {
 	case dns.TypeA:
 		result, _ := dd.containerInfoByDomain(state.QName())
-		if result != nil && result.isCNAME {
-			if dd.traefikCNAME != "" {
-				// Return CNAME record pointing to the traefik server
-				answers = getCNAMEAnswer(state.Name(), dd.traefikCNAME, dd.ttl)
-				// Chase the CNAME: resolve the target through the plugin chain
-				// so the client gets both CNAME + A in one response
-				if extra := dd.chaseCNAME(ctx, w, dd.traefikCNAME, dns.TypeA); extra != nil {
-					answers = append(answers, extra...)
-				}
-			} else if dd.traefikA != nil {
-				// Return A record with the configured traefik IP
-				answers = getAnswer(state.Name(), []net.IP{dd.traefikA}, dd.ttl, false)
+		if result != nil && result.isCNAME && dd.traefikCNAME != "" {
+			answers = getCNAMEAnswer(state.Name(), dd.traefikCNAME, dd.ttl)
+			if extra := dd.chaseCNAME(ctx, w, dd.traefikCNAME, dns.TypeA); extra != nil {
+				answers = append(answers, extra...)
 			}
-		} else if result != nil {
-			answers = getAnswer(state.Name(), []net.IP{result.containerInfo.address}, dd.ttl, false)
+		} else if result != nil && !result.isCNAME && dd.hostIP != nil {
+			answers = getAnswer(state.Name(), []net.IP{dd.hostIP}, dd.ttl, false)
 		}
 	case dns.TypeAAAA:
 		result, _ := dd.containerInfoByDomain(state.QName())
-		if result != nil && result.isCNAME {
-			// For CNAME/traefik domains, return the CNAME for AAAA queries too
-			if dd.traefikCNAME != "" {
-				answers = getCNAMEAnswer(state.Name(), dd.traefikCNAME, dd.ttl)
-				if extra := dd.chaseCNAME(ctx, w, dd.traefikCNAME, dns.TypeAAAA); extra != nil {
-					answers = append(answers, extra...)
-				}
+		if result != nil && result.isCNAME && dd.traefikCNAME != "" {
+			answers = getCNAMEAnswer(state.Name(), dd.traefikCNAME, dd.ttl)
+			if extra := dd.chaseCNAME(ctx, w, dd.traefikCNAME, dns.TypeAAAA); extra != nil {
+				answers = append(answers, extra...)
 			}
-			// For traefik_a mode, we don't return AAAA records (IPv4 only)
-		} else if result != nil && result.containerInfo.address6 != nil {
-			answers = getAnswer(state.Name(), []net.IP{result.containerInfo.address6}, dd.ttl, true)
-		} else if result != nil && result.containerInfo.address != nil {
-			// Per RFC 6147 section 5.1.2: return a NODATA response (empty answer
-			// section with NOERROR rcode) when no AAAA records are available but
-			// an A record exists. We must NOT add a malformed AAAA record.
+		} else if result != nil && !result.isCNAME {
+			// Host-A mode is IPv4-only. Per RFC 6147 §5.1.2 return NODATA
+			// (NOERROR with empty answer) so the resolver doesn't fall
+			// through and answer with something else.
 			m := new(dns.Msg)
 			m.SetReply(r)
 			m.Authoritative = true
 			m.RecursionAvailable = true
-			// Empty answer section = NODATA
 			state.SizeAndDo(m)
 			m = state.Scrub(m)
-			w.WriteMsg(m)
+			_ = w.WriteMsg(m)
 			return dns.RcodeSuccess, nil
 		}
 	case dns.TypeCNAME:
@@ -214,219 +194,159 @@ func (dd *DockerDiscovery) ServeDNS(ctx context.Context, w dns.ResponseWriter, r
 
 	state.SizeAndDo(m)
 	m = state.Scrub(m)
-	err := w.WriteMsg(m)
-	if err != nil {
+	if err := w.WriteMsg(m); err != nil {
 		log.Printf("[docker] Error: %s", err.Error())
 	}
 	return dns.RcodeSuccess, nil
 }
 
-// Name implements plugin.Handler
-func (dd *DockerDiscovery) Name() string {
-	return "docker"
-}
+// Name implements plugin.Handler.
+func (dd *DockerDiscovery) Name() string { return "docker" }
 
-func (dd *DockerDiscovery) getContainerAddress(container *dockerapi.Container, v6 bool) (net.IP, error) {
-
-	// Allow explicit IP override via label
-	if !v6 {
-		if addrStr, ok := container.Config.Labels["coredns.dockerdiscovery.address"]; ok && addrStr != "" {
-			if ip := net.ParseIP(addrStr); ip != nil && ip.To4() != nil {
-				return ip, nil
-			}
-		}
-	}
-
-	// save this away
-	netName, hasNetName := container.Config.Labels["coredns.dockerdiscovery.network"]
-
-	var networkMode string
-
-	for {
-		if container.NetworkSettings.IPAddress != "" && !hasNetName && !v6 {
-			return net.ParseIP(container.NetworkSettings.IPAddress), nil
-		}
-
-		if container.NetworkSettings.GlobalIPv6Address != "" && !hasNetName && v6 {
-			return net.ParseIP(container.NetworkSettings.GlobalIPv6Address), nil
-		}
-
-		networkMode = container.HostConfig.NetworkMode
-
-		// TODO: Deal with containers run with host ip (--net=host)
-		if networkMode == "host" {
-			log.Println("[docker] Container uses host network")
-			return nil, nil
-		}
-
-		if strings.HasPrefix(networkMode, "container:") {
-			log.Printf("Container %s is in another container's network namspace", container.ID[:12])
-			otherID := container.HostConfig.NetworkMode[len("container:"):]
-			var err error
-			container, err = dd.dockerClient.InspectContainerWithOptions(dockerapi.InspectContainerOptions{ID: otherID})
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			break
-		}
-	}
-
-	var (
-		network dockerapi.ContainerNetwork
-		ok      = false
-	)
-
-	if hasNetName {
-		log.Printf("[docker] network name %s specified (%s)", netName, container.ID[:12])
-		network, ok = container.NetworkSettings.Networks[netName]
-	} else if len(container.NetworkSettings.Networks) == 1 {
-		for netName, network = range container.NetworkSettings.Networks {
-			ok = true
-		}
-	} else if networkMode != "" {
-		network, ok = container.NetworkSettings.Networks[networkMode]
-	}
-
-	if !ok { // sometime while "network:disconnect" event fire
-		return nil, fmt.Errorf("unable to find network settings for the network %s", networkMode)
-	}
-
-	if !v6 {
-		return net.ParseIP(network.IPAddress), nil // ParseIP return nil when IPAddress equals ""
-	} else if v6 && len(network.GlobalIPv6Address) > 0 {
-		return net.ParseIP(network.GlobalIPv6Address), nil
-	}
-
-	return nil, nil
-}
-
+// updateContainerInfo (re)builds the per-container record set and pushes
+// any necessary tunnel-ingress changes.
 func (dd *DockerDiscovery) updateContainerInfo(container *dockerapi.Container) error {
 	dd.mutex.Lock()
 	defer dd.mutex.Unlock()
 
-	_, isExist := dd.containerInfoMap[container.ID]
-	if isExist { // remove previous resolved container info
+	// Clean any prior state for this container.
+	prev, hadPrev := dd.containerInfoMap[container.ID]
+	if hadPrev {
 		delete(dd.containerInfoMap, container.ID)
 	}
 
-	// Resolve domains FIRST — CNAME domains (traefik labels) don't need an IP
-	domains, cnameDomains, _ := dd.resolveDomainsByContainer(container)
+	hostADomain, cnameDomains := dd.resolveDomainsByContainer(container)
 
-	// Try to get the container's IP address (needed for A/AAAA records only)
-	containerAddress, err := dd.getContainerAddress(container, false)
-	if err != nil {
-		log.Printf("[docker] Could not resolve IP for container %s (%s): %s", normalizeContainerName(container), container.ID[:12], err)
-	}
-
-	var containerAddress6 net.IP
-	if containerAddress != nil {
-		containerAddress6, _ = dd.getContainerAddress(container, true)
-	}
-
-	// If we have no IP, we can't serve A/AAAA records for regular domains
-	if containerAddress == nil && len(domains) > 0 {
-		log.Printf("[docker] Dropping A/AAAA domains for container %s (%s): no IP address available", normalizeContainerName(container), container.ID[:12])
-		domains = nil
-	}
-
-	if len(domains) > 0 || len(cnameDomains) > 0 {
-		dd.containerInfoMap[container.ID] = &ContainerInfo{
-			container:    container,
-			address:      containerAddress,
-			address6:     containerAddress6,
-			domains:      domains,
-			cnameDomains: cnameDomains,
-		}
-
-		if !isExist {
-			if containerAddress != nil {
-				log.Printf("[docker] Add entry of container %s (%s). IP: %v", normalizeContainerName(container), container.ID[:12], containerAddress)
-			}
-			if len(cnameDomains) > 0 {
-				log.Printf("[docker] Add CNAME entries for container %s (%s): %v", normalizeContainerName(container), container.ID[:12], cnameDomains)
+	if hostADomain == "" && len(cnameDomains) == 0 {
+		if hadPrev {
+			log.Printf("[docker] Remove container entry %s (%s)", normalizeContainerName(container), shortID(container.ID))
+			// If we previously pushed tunnel routes, retract them now.
+			if dd.tunnelSyncer != nil && len(prev.tunnelDomains) > 0 {
+				doms := append([]string(nil), prev.tunnelDomains...)
+				go dd.tunnelSyncer.RemoveRoutes(doms)
 			}
 		}
+		return nil
+	}
 
-		// Check for tunnel label — if present, use tunnel routes instead of DNS
-		var tunnelServiceURL string
-		if dd.tunnelSyncer != nil && container.Config != nil {
-			if labelVal, ok := container.Config.Labels["coredns.dockerdiscovery.cf_tunnel"]; ok {
-				if labelVal != "" && labelVal != "true" {
-					tunnelServiceURL = labelVal
-				} else {
-					// Derive from Traefik service port label
-					if port := getTraefikServicePort(container.Config.Labels); port != "" {
-						tunnelServiceURL = "http://localhost:" + port
-					} else {
-						log.Printf("[docker] Container %s has cf_tunnel label but no service URL or Traefik port", container.ID[:12])
-					}
-				}
+	// Decide which Traefik domains should also be pushed to the tunnel.
+	tunnelOptOut := containerOptsOutOfTunnel(container)
+	var tunnelDomains []string
+	if dd.tunnelSyncer != nil && !tunnelOptOut && dd.cfTunnelTarget != "" {
+		for _, d := range cnameDomains {
+			if dd.cloudflareConfig != nil && dd.cloudflareConfig.ExcludeDomains[d] {
+				continue
 			}
+			tunnelDomains = append(tunnelDomains, d)
 		}
-		dd.containerInfoMap[container.ID].tunnelServiceURL = tunnelServiceURL
+	}
 
-		// Sync to Cloudflare: tunnel routes or DNS CNAME (mutually exclusive)
-		if dd.tunnelSyncer != nil && tunnelServiceURL != "" && len(cnameDomains) > 0 {
-			log.Printf("[docker] Dispatching tunnel sync for container %s: %d domain(s) -> %s", container.ID[:12], len(cnameDomains), tunnelServiceURL)
-			doms := append([]string(nil), cnameDomains...)
-			url := tunnelServiceURL
-			cid := container.ID[:12]
+	dd.containerInfoMap[container.ID] = &ContainerInfo{
+		container:     container,
+		hostADomain:   hostADomain,
+		cnameDomains:  cnameDomains,
+		tunnelDomains: tunnelDomains,
+	}
+
+	if !hadPrev {
+		if hostADomain != "" {
+			log.Printf("[docker] Add host-A entry for %s (%s): %s -> %s", normalizeContainerName(container), shortID(container.ID), hostADomain, dd.hostIP)
+		}
+		if len(cnameDomains) > 0 {
+			log.Printf("[docker] Add CNAME entries for %s (%s): %v", normalizeContainerName(container), shortID(container.ID), cnameDomains)
+		}
+	}
+
+	// Diff tunnel domains against the previous push and reconcile.
+	if dd.tunnelSyncer != nil {
+		var oldDoms []string
+		if hadPrev {
+			oldDoms = prev.tunnelDomains
+		}
+		toAdd, toRemove := diffDomains(oldDoms, tunnelDomains)
+		if len(toRemove) > 0 {
+			doms := append([]string(nil), toRemove...)
+			go dd.tunnelSyncer.RemoveRoutes(doms)
+		}
+		if len(toAdd) > 0 {
+			doms := append([]string(nil), toAdd...)
+			target := dd.cfTunnelTarget
+			cid := shortID(container.ID)
 			go func() {
-				log.Printf("[docker] tunnel sync START container=%s domains=%v", cid, doms)
-				dd.tunnelSyncer.AddRoutes(doms, url)
-				log.Printf("[docker] tunnel sync END container=%s", cid)
+				log.Printf("[docker] tunnel sync container=%s domains=%v target=%s", cid, doms, target)
+				dd.tunnelSyncer.AddRoutes(doms, target)
 			}()
-		} else if dd.cloudflareSyncer != nil && len(cnameDomains) > 0 {
-			log.Printf("[docker] Dispatching cloudflare sync for container %s: %v", container.ID[:12], cnameDomains)
-			doms := append([]string(nil), cnameDomains...)
-			cid := container.ID[:12]
-			go func() {
-				log.Printf("[docker] cloudflare sync START container=%s domains=%v", cid, doms)
-				dd.cloudflareSyncer.SyncDomains(doms)
-				log.Printf("[docker] cloudflare sync END container=%s", cid)
-			}()
-		} else if len(cnameDomains) > 0 {
-			log.Printf("[docker] CNAME domains present but no syncer configured (tunnelSyncer=%v cloudflareSyncer=%v) container=%s domains=%v",
-				dd.tunnelSyncer != nil, dd.cloudflareSyncer != nil, container.ID[:12], cnameDomains)
 		}
-	} else if isExist {
-		log.Printf("[docker] Remove container entry %s (%s)", normalizeContainerName(container), container.ID[:12])
 	}
+
 	return nil
 }
 
+// removeContainerInfo drops a container's record set and retracts any
+// tunnel ingress entries it owned.
 func (dd *DockerDiscovery) removeContainerInfo(containerID string) error {
 	dd.mutex.Lock()
 	defer dd.mutex.Unlock()
 
-	containerInfo, ok := dd.containerInfoMap[containerID]
+	ci, ok := dd.containerInfoMap[containerID]
 	if !ok {
 		log.Printf("[docker] No entry associated with the container %s", shortID(containerID))
 		return nil
 	}
-	// Remove from Cloudflare: tunnel routes or DNS CNAME (mutually exclusive)
-	if dd.tunnelSyncer != nil && containerInfo.tunnelServiceURL != "" && len(containerInfo.cnameDomains) > 0 {
-		domainsToRemove := make([]string, len(containerInfo.cnameDomains))
-		copy(domainsToRemove, containerInfo.cnameDomains)
-		go dd.tunnelSyncer.RemoveRoutes(domainsToRemove)
-	} else if dd.cloudflareSyncer != nil && len(containerInfo.cnameDomains) > 0 {
-		domainsToRemove := make([]string, len(containerInfo.cnameDomains))
-		copy(domainsToRemove, containerInfo.cnameDomains)
-		go dd.cloudflareSyncer.RemoveDomains(domainsToRemove)
+
+	if dd.tunnelSyncer != nil && len(ci.tunnelDomains) > 0 {
+		doms := append([]string(nil), ci.tunnelDomains...)
+		go dd.tunnelSyncer.RemoveRoutes(doms)
 	}
 
-	log.Printf("[docker] Deleting entry %s (%s)", normalizeContainerName(containerInfo.container), containerInfo.container.ID[:12])
+	log.Printf("[docker] Deleting entry %s (%s)", normalizeContainerName(ci.container), shortID(ci.container.ID))
 	delete(dd.containerInfoMap, containerID)
-
 	return nil
+}
+
+// containerOptsOutOfTunnel returns true when the container carries
+// `coredns.dockerdiscovery.cf_tunnel=false` (case-insensitive).
+func containerOptsOutOfTunnel(container *dockerapi.Container) bool {
+	if container.Config == nil {
+		return false
+	}
+	v, ok := container.Config.Labels["coredns.dockerdiscovery.cf_tunnel"]
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "false", "off", "no", "0", "disabled":
+		return true
+	}
+	return false
+}
+
+// diffDomains returns (added, removed) given the previous and current
+// slices. Order is not preserved; small slices so the O(n*m) cost is fine.
+func diffDomains(prev, curr []string) (added, removed []string) {
+	prevSet := make(map[string]bool, len(prev))
+	for _, d := range prev {
+		prevSet[d] = true
+	}
+	currSet := make(map[string]bool, len(curr))
+	for _, d := range curr {
+		currSet[d] = true
+		if !prevSet[d] {
+			added = append(added, d)
+		}
+	}
+	for _, d := range prev {
+		if !currSet[d] {
+			removed = append(removed, d)
+		}
+	}
+	return added, removed
 }
 
 func (dd *DockerDiscovery) start() error {
 	log.Println("[docker] start")
 	log.Printf("[docker] Connecting to Docker endpoint: %s", dd.dockerEndpoint)
 
-	// Test connectivity first
 	if err := dd.dockerClient.Ping(); err != nil {
 		log.Printf("[docker] ERROR: Cannot ping Docker API at %s: %s", dd.dockerEndpoint, err)
 		log.Println("[docker] If using Podman, ensure the Podman socket is enabled:")
@@ -437,30 +357,18 @@ func (dd *DockerDiscovery) start() error {
 	}
 	log.Println("[docker] Successfully connected to Docker/Podman API")
 
-	// Initial container scan + periodic safety-net re-scan.
-	// The re-scan catches any events the listener missed (e.g. during a
-	// reconnect or if the daemon dropped events under load).
-	dd.scanAllContainers("startup")
-	go dd.periodicRescan()
-
-	// Heartbeat: confirms the plugin's main goroutine is alive and the
-	// listener loop is currently waiting for events. If you stop seeing
-	// these in the logs, the goroutine has exited.
-	go dd.heartbeat()
-
-	// Reconnect loop. AddEventListener can fail and the events channel
-	// can close at any time (daemon restart, socket replacement, network
-	// blip). Without this loop a single disconnect would leave CoreDNS
-	// running with no event processing until manually restarted.
-	backoff := time.Second
-	const maxBackoff = 30 * time.Second
+	// Reconnect loop. The fsouza event listener is a long-poll HTTP stream;
+	// Podman, idle timeouts, network blips, or socket restarts all silently
+	// close it. Without this loop the plugin becomes blind to new containers
+	// until CoreDNS itself is restarted.
+	const (
+		minBackoff = 1 * time.Second
+		maxBackoff = 30 * time.Second
+	)
+	backoff := minBackoff
 	for {
-		err := dd.runEventListener()
-		if err == nil {
-			// Channel closed cleanly — treat as a disconnect and reconnect.
-			err = errors.New("event channel closed")
-		}
-		log.Printf("[docker] Event listener exited: %s — reconnecting in %s", err, backoff)
+		err := dd.runEventLoop()
+		log.Printf("[docker] event loop ended (%v); reconnecting in %s", err, backoff)
 		time.Sleep(backoff)
 		if backoff < maxBackoff {
 			backoff *= 2
@@ -468,131 +376,110 @@ func (dd *DockerDiscovery) start() error {
 				backoff = maxBackoff
 			}
 		}
-
-		if pingErr := dd.dockerClient.Ping(); pingErr != nil {
-			log.Printf("[docker] Ping failed during reconnect: %s — will keep retrying", pingErr)
+		if perr := dd.dockerClient.Ping(); perr != nil {
+			log.Printf("[docker] reconnect ping failed: %s", perr)
 			continue
 		}
-		// On a successful reconnect, do a full re-scan so we don't miss
-		// any containers that started during the outage.
-		dd.scanAllContainers("post-reconnect")
-		backoff = time.Second
+		log.Println("[docker] reconnect ping ok; restarting event listener")
+		backoff = minBackoff
 	}
 }
 
-// runEventListener registers an event listener and processes events
-// until the channel closes or registration fails. It returns the error
-// (or nil if the channel just closed).
-func (dd *DockerDiscovery) runEventListener() error {
-	events := make(chan *dockerapi.APIEvents)
-
+// runEventLoop registers an event listener, performs a full container
+// resync (covering anything we missed during the disconnect), then drains
+// events until the channel closes or the heartbeat detects a dead
+// connection. Returns when the listener is no longer usable.
+func (dd *DockerDiscovery) runEventLoop() error {
+	events := make(chan *dockerapi.APIEvents, 16)
 	if err := dd.dockerClient.AddEventListener(events); err != nil {
-		log.Printf("[docker] ERROR: Failed to add event listener: %s", err)
-		return err
+		return fmt.Errorf("AddEventListener: %w", err)
 	}
-	log.Println("[docker] Event listener registered successfully — listening for events...")
-
-	// Best-effort cleanup on exit.
-	defer func() {
+	log.Println("[docker] Event listener registered successfully")
+	listenerRemoved := false
+	removeListener := func() {
+		if listenerRemoved {
+			return
+		}
+		listenerRemoved = true
 		if err := dd.dockerClient.RemoveEventListener(events); err != nil {
 			log.Printf("[docker] RemoveEventListener: %s", err)
 		}
+	}
+	defer removeListener()
+
+	if err := dd.resyncAll(); err != nil {
+		return fmt.Errorf("resync: %w", err)
+	}
+
+	// Heartbeat: ping the daemon periodically. If the ping fails we force
+	// the events channel to close by removing the listener; the for-range
+	// below then exits and start()'s outer loop reconnects.
+	stopHeartbeat := make(chan struct{})
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		t := time.NewTicker(15 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-stopHeartbeat:
+				return
+			case <-t.C:
+				if err := dd.dockerClient.Ping(); err != nil {
+					log.Printf("[docker] heartbeat ping failed: %s; closing event listener", err)
+					removeListener()
+					return
+				}
+			}
+		}
+	}()
+	defer func() {
+		close(stopHeartbeat)
+		<-heartbeatDone
 	}()
 
+	log.Println("[docker] Listening for events...")
 	for msg := range events {
-		dd.handleDockerEvent(msg)
+		go dd.handleEvent(msg)
 	}
-	return nil
+	return errors.New("events channel closed")
 }
 
-// handleDockerEvent dispatches a single Docker/Podman event.
-func (dd *DockerDiscovery) handleDockerEvent(msg *dockerapi.APIEvents) {
-	go func(msg *dockerapi.APIEvents) {
-		event := fmt.Sprintf("%s:%s", msg.Type, msg.Action)
-		if msg.Action == "health_status" || strings.HasPrefix(msg.Action, "health_status:") {
-			return
-		}
-		log.Printf("[docker] Received event: %s (actor: %s)", event, shortID(msg.Actor.ID))
-		switch event {
-		case "container:start":
-			log.Println("[docker] New container spawned. Attempt to add A/AAAA records for it")
-
-			container, err := dd.dockerClient.InspectContainerWithOptions(dockerapi.InspectContainerOptions{ID: msg.Actor.ID})
-			if err != nil {
-				log.Printf("[docker] Event error %s #%s: %s", event, shortID(msg.Actor.ID), err)
-				return
-			}
-			if err := dd.updateContainerInfo(container); err != nil {
-				log.Printf("[docker] Error adding A/AAAA records for container %s: %s", shortID(container.ID), err)
-			}
-		case "container:die":
-			log.Println("[docker] Container being stopped. Attempt to remove its A/AAAA records from the DNS", shortID(msg.Actor.ID))
-			if err := dd.removeContainerInfo(msg.Actor.ID); err != nil {
-				log.Printf("[docker] Error deleting A/AAAA records for container: %s: %s", shortID(msg.Actor.ID), err)
-			}
-		case "network:connect":
-			// take a look https://gist.github.com/josefkarasek/be9bac36921f7bc9a61df23451594fbf for example of same event's types attributes
-			log.Printf("[docker] Container %s being connected to network %s.", shortID(msg.Actor.Attributes["container"]), msg.Actor.Attributes["name"])
-
-			container, err := dd.dockerClient.InspectContainerWithOptions(dockerapi.InspectContainerOptions{ID: msg.Actor.Attributes["container"]})
-			if err != nil {
-				log.Printf("[docker] Event error %s #%s: %s", event, shortID(msg.Actor.Attributes["container"]), err)
-				return
-			}
-			if err := dd.updateContainerInfo(container); err != nil {
-				log.Printf("[docker] Error adding A/AAAA records for container %s: %s", shortID(container.ID), err)
-			}
-		case "network:disconnect":
-			log.Printf("[docker] Container %s being disconnected from network %s", shortID(msg.Actor.Attributes["container"]), msg.Actor.Attributes["name"])
-
-			container, err := dd.dockerClient.InspectContainerWithOptions(dockerapi.InspectContainerOptions{ID: msg.Actor.Attributes["container"]})
-			if err != nil {
-				log.Printf("[docker] Event error %s #%s: %s", event, shortID(msg.Actor.Attributes["container"]), err)
-				return
-			}
-			if err := dd.updateContainerInfo(container); err != nil {
-				log.Printf("[docker] Error adding A/AAAA records for container %s: %s", shortID(container.ID), err)
-			}
-		}
-	}(msg)
-}
-
-// scanAllContainers lists every running container and (re)processes it.
-// Used at startup, after a reconnect, and on the periodic safety-net
-// timer so that any events missed by the listener still land in the map.
-func (dd *DockerDiscovery) scanAllContainers(reason string) {
+// resyncAll performs a full reconciliation against the live container
+// list: ensures every running container is reflected in our state, and
+// reaps entries for containers that have disappeared (in case we missed a
+// die event during a disconnect).
+func (dd *DockerDiscovery) resyncAll() error {
 	containers, err := dd.dockerClient.ListContainers(dockerapi.ListContainersOptions{})
 	if err != nil {
-		log.Printf("[docker] scan(%s): ERROR listing containers: %s", reason, err)
-		return
+		return err
 	}
-	log.Printf("[docker] scan(%s): found %d running containers", reason, len(containers))
+	log.Printf("[docker] Found %d running containers", len(containers))
 
 	seen := make(map[string]bool, len(containers))
 	for _, apiContainer := range containers {
 		seen[apiContainer.ID] = true
-		log.Printf("[docker] scan(%s): inspecting container %s (names: %v)", reason, apiContainer.ID[:12], apiContainer.Names)
+		log.Printf("[docker] Inspecting container %s (names: %v)", shortID(apiContainer.ID), apiContainer.Names)
 		container, err := dd.dockerClient.InspectContainerWithOptions(dockerapi.InspectContainerOptions{ID: apiContainer.ID})
 		if err != nil {
-			log.Printf("[docker] scan(%s): ERROR inspecting container %s: %s", reason, apiContainer.ID[:12], err)
+			log.Printf("[docker] ERROR: Failed to inspect container %s: %s", shortID(apiContainer.ID), err)
 			continue
 		}
 
-		// Debug: show labels
 		if container.Config != nil {
 			for label, value := range container.Config.Labels {
 				if strings.HasPrefix(label, "traefik.") || strings.HasPrefix(label, "coredns.") {
-					log.Printf("[docker] scan(%s):   Label: %s = %s", reason, label, value)
+					log.Printf("[docker]   Label: %s = %s", label, value)
 				}
 			}
 		}
 
 		if err := dd.updateContainerInfo(container); err != nil {
-			log.Printf("[docker] scan(%s): error updating container %s: %s", reason, container.ID[:12], err)
+			log.Printf("[docker] Error adding records for container %s: %s", shortID(container.ID), err)
 		}
 	}
 
-	// Drop entries for containers that disappeared while we weren't listening.
+	// Reap stale entries (containers we know about but Docker no longer does).
 	dd.mutex.RLock()
 	stale := make([]string, 0)
 	for id := range dd.containerInfoMap {
@@ -602,36 +489,45 @@ func (dd *DockerDiscovery) scanAllContainers(reason string) {
 	}
 	dd.mutex.RUnlock()
 	for _, id := range stale {
-		log.Printf("[docker] scan(%s): removing stale container entry %s", reason, shortID(id))
+		log.Printf("[docker] Reaping stale entry for absent container %s", shortID(id))
 		if err := dd.removeContainerInfo(id); err != nil {
-			log.Printf("[docker] scan(%s): error removing stale entry %s: %s", reason, shortID(id), err)
+			log.Printf("[docker] Error removing stale container %s: %s", shortID(id), err)
 		}
 	}
-	log.Printf("[docker] scan(%s): complete", reason)
+	log.Println("[docker] Resync complete")
+	return nil
 }
 
-// periodicRescan re-scans all containers on a fixed interval as a
-// safety net for any events the listener missed.
-func (dd *DockerDiscovery) periodicRescan() {
-	const interval = 60 * time.Second
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for range t.C {
-		dd.scanAllContainers("periodic")
+// handleEvent dispatches a single Docker/Podman event.
+func (dd *DockerDiscovery) handleEvent(msg *dockerapi.APIEvents) {
+	event := fmt.Sprintf("%s:%s", msg.Type, msg.Action)
+	if msg.Action == "health_status" || strings.HasPrefix(msg.Action, "health_status:") {
+		return
 	}
-}
-
-// heartbeat logs a line every minute summarising plugin state. If you
-// stop seeing these, the goroutine is dead.
-func (dd *DockerDiscovery) heartbeat() {
-	t := time.NewTicker(60 * time.Second)
-	defer t.Stop()
-	for range t.C {
-		dd.mutex.RLock()
-		n := len(dd.containerInfoMap)
-		dd.mutex.RUnlock()
-		log.Printf("[docker] heartbeat: %d containers tracked, cloudflareSyncer=%v tunnelSyncer=%v",
-			n, dd.cloudflareSyncer != nil, dd.tunnelSyncer != nil)
+	log.Printf("[docker] Received event: %s (actor: %s)", event, shortID(msg.Actor.ID))
+	switch event {
+	case "container:start":
+		container, err := dd.dockerClient.InspectContainerWithOptions(dockerapi.InspectContainerOptions{ID: msg.Actor.ID})
+		if err != nil {
+			log.Printf("[docker] Event error %s #%s: %s", event, shortID(msg.Actor.ID), err)
+			return
+		}
+		if err := dd.updateContainerInfo(container); err != nil {
+			log.Printf("[docker] Error adding records for container %s: %s", shortID(container.ID), err)
+		}
+	case "container:die":
+		if err := dd.removeContainerInfo(msg.Actor.ID); err != nil {
+			log.Printf("[docker] Error deleting records for container %s: %s", shortID(msg.Actor.ID), err)
+		}
+	case "network:connect", "network:disconnect":
+		container, err := dd.dockerClient.InspectContainerWithOptions(dockerapi.InspectContainerOptions{ID: msg.Actor.Attributes["container"]})
+		if err != nil {
+			log.Printf("[docker] Event error %s #%s: %s", event, shortID(msg.Actor.Attributes["container"]), err)
+			return
+		}
+		if err := dd.updateContainerInfo(container); err != nil {
+			log.Printf("[docker] Error adding records for container %s: %s", shortID(container.ID), err)
+		}
 	}
 }
 
@@ -645,7 +541,6 @@ func shortID(id string) string {
 
 // getCNAMEAnswer creates a CNAME DNS response record.
 func getCNAMEAnswer(zone string, target string, ttl uint32) []dns.RR {
-	// Ensure target has trailing dot for FQDN
 	if !strings.HasSuffix(target, ".") {
 		target = target + "."
 	}
@@ -660,7 +555,7 @@ func getCNAMEAnswer(zone string, target string, ttl uint32) []dns.RR {
 	return []dns.RR{record}
 }
 
-// getAnswer function takes a slice of net.IPs and returns a slice of A/AAAA RRs.
+// getAnswer takes a slice of net.IPs and returns A or AAAA records.
 func getAnswer(zone string, ips []net.IP, ttl uint32, v6 bool) []dns.RR {
 	answers := []dns.RR{}
 	for _, ip := range ips {
@@ -674,7 +569,7 @@ func getAnswer(zone string, ips []net.IP, ttl uint32, v6 bool) []dns.RR {
 			}
 			record.A = ip
 			answers = append(answers, record)
-		} else if v6 {
+		} else {
 			record := new(dns.AAAA)
 			record.Hdr = dns.RR_Header{
 				Name:   zone,
@@ -690,9 +585,7 @@ func getAnswer(zone string, ips []net.IP, ttl uint32, v6 bool) []dns.RR {
 }
 
 // chaseCNAME resolves a CNAME target by issuing a loopback DNS query to
-// the server's own listener. This ensures the query traverses the full
-// plugin chain from the top (e.g. hosts → docker → forward), unlike
-// plugin.NextOrFailure which only reaches plugins after the current one.
+// the server's own listener so the query traverses the full plugin chain.
 func (dd *DockerDiscovery) chaseCNAME(ctx context.Context, w dns.ResponseWriter, target string, qtype uint16) []dns.RR {
 	if !strings.HasSuffix(target, ".") {
 		target += "."
@@ -711,11 +604,7 @@ func (dd *DockerDiscovery) chaseCNAME(ctx context.Context, w dns.ResponseWriter,
 	return r.Answer
 }
 
-// raResponseWriter wraps a dns.ResponseWriter and ensures the
-// RecursionAvailable (RA) flag is set on all outgoing responses.
-// This is needed because some downstream plugins (e.g. hosts) don't
-// set RA, which causes resolvers like nslookup to skip the response
-// and fall through to a secondary nameserver.
+// raResponseWriter wraps dns.ResponseWriter and forces RecursionAvailable.
 type raResponseWriter struct {
 	dns.ResponseWriter
 }

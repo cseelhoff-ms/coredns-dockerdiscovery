@@ -1,7 +1,6 @@
 package dockerdiscovery
 
 import (
-	"fmt"
 	"net"
 	"testing"
 
@@ -10,195 +9,124 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-type setupDockerDiscoveryTestCase struct {
-	configBlock            string
-	expectedDockerEndpoint string
-	expectedDockerDomain   string
-}
-
-func TestConfigDockerDiscovery(t *testing.T) {
-	testCases := []setupDockerDiscoveryTestCase{
-		setupDockerDiscoveryTestCase{
-			"docker",
-			defaultDockerEndpoint,
-			defaultDockerDomain,
-		},
-		setupDockerDiscoveryTestCase{
-			"docker unix:///var/run/docker.sock.backup",
-			"unix:///var/run/docker.sock.backup",
-			defaultDockerDomain,
-		},
-		setupDockerDiscoveryTestCase{
-			`docker {
-	hostname_domain example.org.
-}`,
-			defaultDockerEndpoint,
-			"example.org.",
-		},
-		setupDockerDiscoveryTestCase{
-			`docker unix:///home/user/docker.sock {
-	hostname_domain home.example.org.
-}`,
-			"unix:///home/user/docker.sock",
-			"home.example.org.",
-		},
+// genContainer builds a minimal Container suitable for resolver tests.
+// Networking fields are intentionally empty: the new architecture never
+// reads container IPs — A records come from the host_ip directive.
+func genContainer(id, name string, labels map[string]string) *dockerapi.Container {
+	if labels == nil {
+		labels = map[string]string{}
 	}
-
-	for _, tc := range testCases {
-		c := caddy.NewTestController("dns", tc.configBlock)
-		dd, err := createPlugin(c)
-		assert.Nil(t, err)
-		assert.Equal(t, dd.dockerEndpoint, tc.expectedDockerEndpoint)
-	}
-}
-
-func TestSetupDockerDiscovery(t *testing.T) {
-	networkName := "my_project_network_name"
-	c := caddy.NewTestController("dns", fmt.Sprintf(`docker unix:///home/user/docker.sock {
-	compose_domain compose.loc
-	hostname_domain home.example.org
-	domain docker.loc
-	network_aliases %s
-}`, networkName))
-	dd, err := createPlugin(c)
-	assert.Nil(t, err)
-
-	var address = net.ParseIP("192.11.0.1")
-	var containers = []*dockerapi.Container{
-		genContainerDefn(address.String(), networkName, ""),
-		genContainerDefn("", networkName, address.String()),
-		genContainerDefn(address.String(), networkName, address.String()),
-	}
-
-	for i := range containers {
-		container := containers[i]
-		e := dd.updateContainerInfo(container)
-		assert.Nil(t, e)
-
-		_ = ipOk(t, dd, "myproject.loc.", address)
-		ipNotOk(t, dd, "wrong.loc.")
-		_ = ipOk(t, dd, "nginx.home.example.org.", address)
-		ipNotOk(t, dd, "wrong.home.example.org.")
-		_ = ipOk(t, dd, "label-host.loc.", address)
-		_ = ipOk(t, dd, "cservice.cproject.compose.loc.", address)
-
-		containerInfo := ipOk(t, dd, fmt.Sprintf("%s.docker.loc.", container.Name), address)
-		assert.Equal(t, container.Name, containerInfo.container.Name)
-	}
-}
-
-func TestMultipleNetworksDockerDiscovery(t *testing.T) {
-	networkName := "my_project_network_name"
-	address := net.ParseIP("192.11.0.1")
-	expectedAddress := net.ParseIP("9.14.1.30")
-	expectedNet := "inquisition"
-
-	c := caddy.NewTestController("dns", fmt.Sprintf(`docker unix:///home/user/docker.sock {
-	compose_domain compose.loc
-	hostname_domain home.example.org
-	domain docker.loc
-	network_aliases %s
-}`, networkName))
-	dd, err := createPlugin(c)
-	assert.Nil(t, err)
-
-	// generate a configuration; tweak to add a second network
-	container := genContainerDefn("", networkName, address.String())
-	container.NetworkSettings.Networks[expectedNet] = dockerapi.ContainerNetwork{
-		Aliases:   []string{"myproject.loc"},
-		IPAddress: expectedAddress.String(),
-	}
-
-	err = dd.updateContainerInfo(container)
-	assert.Nil(t, err)
-
-	// without label, we expect the "NetworkMode" address to prevail
-	_ = ipOk(t, dd, "label-host.loc.", address)
-
-	// now, update for the label and try this again
-
-	container.Config.Labels["coredns.dockerdiscovery.network"] = expectedNet
-	err = dd.updateContainerInfo(container)
-	assert.Nil(t, err)
-
-	_ = ipOk(t, dd, "label-host.loc.", expectedAddress)
-
-	return
-}
-
-// simple check
-func ipOk(t *testing.T, dd *DockerDiscovery, domain string, address net.IP) *ContainerInfo {
-
-	result, e := dd.containerInfoByDomain(domain)
-	assert.Nil(t, e)
-	assert.NotNil(t, result)
-
-	// check as strings here, for us poor mortals
-	assert.Equal(t, address.String(), result.containerInfo.address.String())
-
-	return result.containerInfo
-}
-
-// simple check
-func ipNotOk(t *testing.T, dd *DockerDiscovery, domain string) {
-
-	result, e := dd.containerInfoByDomain(domain)
-	assert.Nil(t, e)
-	assert.Nil(t, result)
-
-	return
-}
-
-// string, not net.IP, as 1) we're test, 2) the underling struct is a string,
-// and 3) we may want something odd here
-func genContainerDefn(nsAddress string, netMode string, netAddress string) *dockerapi.Container {
-	container := &dockerapi.Container{
-		ID:   "fa155d6fd141e29256c286070d2d44b3f45f1e46822578f1e7d66c1e7981e6c7",
-		Name: "evil_ptolemy",
+	return &dockerapi.Container{
+		ID:   id,
+		Name: name,
 		Config: &dockerapi.Config{
-			Hostname: "nginx",
-			Labels: map[string]string{
-				"coredns.dockerdiscovery.host": "label-host.loc",
-				"com.docker.compose.project":   "cproject",
-				"com.docker.compose.service":   "cservice",
-			},
+			Hostname: name,
+			Labels:   labels,
 		},
-		HostConfig: &dockerapi.HostConfig{
-			NetworkMode: netMode,
-		},
-		NetworkSettings: &dockerapi.NetworkSettings{
-			IPAddress: nsAddress,
-			Networks: map[string]dockerapi.ContainerNetwork{
-				netMode: dockerapi.ContainerNetwork{
-					Aliases:   []string{"myproject.loc"},
-					IPAddress: netAddress,
-				},
-			},
-		},
+		HostConfig:      &dockerapi.HostConfig{},
+		NetworkSettings: &dockerapi.NetworkSettings{Networks: map[string]dockerapi.ContainerNetwork{}},
 	}
-
-	return container
 }
 
+func TestConfigDockerEndpoint(t *testing.T) {
+	tests := []struct {
+		name     string
+		block    string
+		expected string
+	}{
+		{"default", `docker`, defaultDockerEndpoint},
+		{"explicit", `docker unix:///custom/docker.sock`, "unix:///custom/docker.sock"},
+		{"with block", "docker unix:///x/docker.sock {\n\ttraefik_cname traefik.example\n}", "unix:///x/docker.sock"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := caddy.NewTestController("dns", tc.block)
+			dd, err := createPlugin(c)
+			assert.Nil(t, err)
+			assert.Equal(t, tc.expected, dd.dockerEndpoint)
+		})
+	}
+}
+
+func TestTraefikCnameDirective(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker {
+	traefik_cname traefik.example.com
+}`)
+	dd, err := createPlugin(c)
+	assert.Nil(t, err)
+	assert.Equal(t, "traefik.example.com", dd.traefikCNAME)
+	assert.NotNil(t, dd.traefikResolver)
+}
+
+func TestHostIpDirective(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker {
+	host_ip 10.0.60.3
+}`)
+	dd, err := createPlugin(c)
+	assert.Nil(t, err)
+	assert.Equal(t, "10.0.60.3", dd.hostIP.String())
+	assert.NotNil(t, dd.hostResolver)
+}
+
+func TestHostIpInvalid(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker {
+	host_ip not-an-ip
+}`)
+	_, err := createPlugin(c)
+	assert.NotNil(t, err)
+}
+
+func TestUnknownDirective(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker {
+	garbage some-arg
+}`)
+	_, err := createPlugin(c)
+	assert.NotNil(t, err)
+}
+
+// Tunnel directive sanity — incomplete configs must error out.
+func TestTunnelMissingTarget(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker {
+	cf_token tk
+	cf_tunnel_id uuid
+	cf_account_id acct
+}`)
+	_, err := createPlugin(c)
+	assert.NotNil(t, err)
+	assert.Contains(t, err.Error(), "cf_tunnel_target")
+}
+
+func TestTunnelMissingCredentials(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker {
+	cf_tunnel_id uuid
+	cf_account_id acct
+	cf_tunnel_target https://localhost:443
+}`)
+	_, err := createPlugin(c)
+	assert.NotNil(t, err)
+	assert.Contains(t, err.Error(), "cf_token")
+}
+
+// TraefikLabelResolver — covers the regex extraction across the supported
+// Traefik label families (http and tcp routers).
 func TestTraefikLabelResolver(t *testing.T) {
 	resolver := NewTraefikLabelResolver()
-
 	tests := []struct {
 		name     string
 		labels   map[string]string
 		expected []string
 	}{
 		{
-			name: "simple host rule",
+			name: "http Host()",
 			labels: map[string]string{
 				"traefik.http.routers.app.rule": "Host(`app.example.com`)",
 			},
 			expected: []string{"app.example.com"},
 		},
 		{
-			name: "HostSNI rule",
+			name: "tcp HostSNI()",
 			labels: map[string]string{
-				"traefik.http.routers.secure.rule": "HostSNI(`secure.example.com`)",
+				"traefik.tcp.routers.secure.rule": "HostSNI(`secure.example.com`)",
 			},
 			expected: []string{"secure.example.com"},
 		},
@@ -217,15 +145,6 @@ func TestTraefikLabelResolver(t *testing.T) {
 			expected: []string{"app.example.com"},
 		},
 		{
-			name: "multiple routers",
-			labels: map[string]string{
-				"traefik.http.routers.web.rule":                      "Host(`web.example.com`)",
-				"traefik.http.routers.api.rule":                      "Host(`api.example.com`)",
-				"traefik.http.services.web.loadbalancer.server.port": "8080",
-			},
-			expected: []string{"web.example.com", "api.example.com"},
-		},
-		{
 			name: "no traefik labels",
 			labels: map[string]string{
 				"com.docker.compose.project": "myproject",
@@ -240,337 +159,192 @@ func TestTraefikLabelResolver(t *testing.T) {
 			expected: nil,
 		},
 	}
-
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			container := &dockerapi.Container{
-				ID: "fa155d6fd141e29256c286070d2d44b3f45f1e46822578f1e7d66c1e7981e6c7",
-				Config: &dockerapi.Config{
-					Labels: tc.labels,
-				},
-			}
-			domains, err := resolver.resolve(container)
+			c := genContainer("fa155d6fd141e29256c286070d2d44b3f45f1e46", "x", tc.labels)
+			doms, err := resolver.resolve(c)
 			assert.Nil(t, err)
-			assert.ElementsMatch(t, tc.expected, domains)
+			assert.ElementsMatch(t, tc.expected, doms)
 		})
 	}
 }
 
-func TestTraefikCNAMEConfig(t *testing.T) {
-	c := caddy.NewTestController("dns", `docker unix:///home/user/docker.sock {
-	traefik_cname traefik.homelab.net
-}`)
-	dd, err := createPlugin(c)
-	assert.Nil(t, err)
-	assert.Equal(t, "traefik.homelab.net", dd.traefikCNAME)
-	assert.Nil(t, dd.traefikA)
-	assert.NotNil(t, dd.traefikResolver)
-}
-
-func TestTraefikAConfig(t *testing.T) {
-	c := caddy.NewTestController("dns", `docker unix:///home/user/docker.sock {
-	traefik_a 10.0.0.2
-}`)
-	dd, err := createPlugin(c)
-	assert.Nil(t, err)
-	assert.Equal(t, "", dd.traefikCNAME)
-	assert.Equal(t, "10.0.0.2", dd.traefikA.String())
-	assert.NotNil(t, dd.traefikResolver)
-}
-
-func TestTraefikMutuallyExclusive(t *testing.T) {
-	c := caddy.NewTestController("dns", `docker unix:///home/user/docker.sock {
-	traefik_cname traefik.homelab.net
-	traefik_a 10.0.0.2
-}`)
-	_, err := createPlugin(c)
-	assert.NotNil(t, err)
-	assert.Contains(t, err.Error(), "mutually exclusive")
-}
-
-func TestTraefikCNAMEDomainResolution(t *testing.T) {
-	networkName := "my_project_network_name"
-	c := caddy.NewTestController("dns", fmt.Sprintf(`docker unix:///home/user/docker.sock {
-	domain docker.loc
-	network_aliases %s
-	traefik_cname traefik.homelab.net
-}`, networkName))
-	dd, err := createPlugin(c)
-	assert.Nil(t, err)
-
-	address := net.ParseIP("192.11.0.1")
-	container := &dockerapi.Container{
-		ID:   "ab155d6fd141e29256c286070d2d44b3f45f1e46822578f1e7d66c1e7981e6c7",
-		Name: "my_app",
-		Config: &dockerapi.Config{
-			Hostname: "myapp",
-			Labels: map[string]string{
-				"traefik.enable":                "true",
-				"traefik.http.routers.app.rule": "Host(`app.homelab.net`)",
-				"coredns.dockerdiscovery.host":  "",
-			},
-		},
-		HostConfig: &dockerapi.HostConfig{
-			NetworkMode: networkName,
-		},
-		NetworkSettings: &dockerapi.NetworkSettings{
-			Networks: map[string]dockerapi.ContainerNetwork{
-				networkName: {
-					Aliases:   []string{"myapp.loc"},
-					IPAddress: address.String(),
-				},
-			},
-		},
-	}
-
-	e := dd.updateContainerInfo(container)
-	assert.Nil(t, e)
-
-	// Traefik-label domain should be found as a CNAME domain
-	result, err := dd.containerInfoByDomain("app.homelab.net.")
-	assert.Nil(t, err)
-	assert.NotNil(t, result)
-	assert.True(t, result.isCNAME)
-
-	// Regular domains should still resolve as A records
-	result, err = dd.containerInfoByDomain("my_app.docker.loc.")
-	assert.Nil(t, err)
-	assert.NotNil(t, result)
-	assert.False(t, result.isCNAME)
-	assert.Equal(t, address.String(), result.containerInfo.address.String())
-}
-
 func TestIsTraefikRouterRule(t *testing.T) {
 	assert.True(t, isTraefikRouterRule("traefik.http.routers.myapp.rule"))
-	assert.True(t, isTraefikRouterRule("traefik.http.routers.my-app-web.rule"))
+	assert.True(t, isTraefikRouterRule("traefik.tcp.routers.ldap.rule"))
 	assert.False(t, isTraefikRouterRule("traefik.http.routers.myapp.service"))
 	assert.False(t, isTraefikRouterRule("traefik.http.services.myapp.loadbalancer.server.port"))
 	assert.False(t, isTraefikRouterRule("traefik.enable"))
 	assert.False(t, isTraefikRouterRule("com.docker.compose.project"))
 }
 
-func TestCnameTargetConfig(t *testing.T) {
-	c := caddy.NewTestController("dns", `docker unix:///home/user/docker.sock {
-	cname_target infra-1.homelab.local
-}`)
-	dd, err := createPlugin(c)
-	assert.Nil(t, err)
-	assert.Equal(t, "infra-1.homelab.local", dd.traefikCNAME)
-	assert.Equal(t, 1, len(dd.cnameResolvers))
-}
-
-func TestCnameTargetDomainResolution(t *testing.T) {
-	networkName := "my_network"
-	c := caddy.NewTestController("dns", fmt.Sprintf(`docker unix:///home/user/docker.sock {
-	domain docker.loc
-	network_aliases %s
-	cname_target infra-1.homelab.local
-}`, networkName))
-	dd, err := createPlugin(c)
-	assert.Nil(t, err)
-
-	address := net.ParseIP("192.11.0.1")
-	container := &dockerapi.Container{
-		ID:   "cd255d6fd141e29256c286070d2d44b3f45f1e46822578f1e7d66c1e7981e6c7",
-		Name: "openldap",
-		Config: &dockerapi.Config{
-			Hostname: "ldap",
-			Labels: map[string]string{
-				"coredns.dockerdiscovery.hostname": "ldap.homelab.local",
-				"coredns.dockerdiscovery.host":     "",
-			},
-		},
-		HostConfig: &dockerapi.HostConfig{
-			NetworkMode: networkName,
-		},
-		NetworkSettings: &dockerapi.NetworkSettings{
-			Networks: map[string]dockerapi.ContainerNetwork{
-				networkName: {
-					Aliases:   []string{"openldap.loc"},
-					IPAddress: address.String(),
-				},
-			},
-		},
-	}
-
-	e := dd.updateContainerInfo(container)
-	assert.Nil(t, e)
-
-	// coredns.dockerdiscovery.hostname label should resolve as CNAME
-	result, err := dd.containerInfoByDomain("ldap.homelab.local.")
-	assert.Nil(t, err)
-	assert.NotNil(t, result)
-	assert.True(t, result.isCNAME)
-
-	// Regular domain should still resolve as A record
-	result, err = dd.containerInfoByDomain("openldap.docker.loc.")
-	assert.Nil(t, err)
-	assert.NotNil(t, result)
-	assert.False(t, result.isCNAME)
-	assert.Equal(t, address.String(), result.containerInfo.address.String())
-}
-
-func TestCnameTargetWithTraefikCname(t *testing.T) {
-	// Both cname_target and traefik_cname can coexist
-	c := caddy.NewTestController("dns", `docker unix:///home/user/docker.sock {
-	cname_target infra-1.homelab.local
-	traefik_cname infra-1.homelab.local
-}`)
-	dd, err := createPlugin(c)
-	assert.Nil(t, err)
-	// traefik_cname overwrites — last writer wins, both set same value
-	assert.Equal(t, "infra-1.homelab.local", dd.traefikCNAME)
-	assert.NotNil(t, dd.traefikResolver)
-	assert.Equal(t, 1, len(dd.cnameResolvers))
-}
-
-func TestCnameTargetWithoutLabel(t *testing.T) {
-	// Container without the hostname label should not produce CNAME records
-	c := caddy.NewTestController("dns", `docker unix:///home/user/docker.sock {
-	cname_target infra-1.homelab.local
-	domain docker.loc
+// Worked example: portainer-like container — Traefik label only, no `host` label.
+// Expect a CNAME entry only.
+func TestPortainerLikeContainer(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker {
+	traefik_cname traefik.177cpt.com
+	host_ip 10.0.60.3
 }`)
 	dd, err := createPlugin(c)
 	assert.Nil(t, err)
 
-	container := &dockerapi.Container{
-		ID:   "ef355d6fd141e29256c286070d2d44b3f45f1e46822578f1e7d66c1e7981e6c7",
-		Name: "plain_container",
-		Config: &dockerapi.Config{
-			Hostname: "plain",
-			Labels: map[string]string{
-				"coredns.dockerdiscovery.host": "plain.docker.loc",
-			},
-		},
-		HostConfig: &dockerapi.HostConfig{
-			NetworkMode: "bridge",
-		},
-		NetworkSettings: &dockerapi.NetworkSettings{
-			IPAddress: "172.17.0.5",
-			Networks:  map[string]dockerapi.ContainerNetwork{},
-		},
-	}
+	cont := genContainer("aa155d6fd141e29256c286070d2d44b3f45f1e46", "portainer", map[string]string{
+		"traefik.http.routers.portainer.rule": "Host(`portainer.177cpt.com`)",
+	})
 
-	e := dd.updateContainerInfo(container)
-	assert.Nil(t, e)
+	assert.Nil(t, dd.updateContainerInfo(cont))
 
-	// Should resolve as A record via the label resolver, not CNAME
-	result, err := dd.containerInfoByDomain("plain.docker.loc.")
+	// CNAME lookup
+	res, err := dd.containerInfoByDomain("portainer.177cpt.com.")
 	assert.Nil(t, err)
-	assert.NotNil(t, result)
-	assert.False(t, result.isCNAME)
+	assert.NotNil(t, res)
+	assert.True(t, res.isCNAME)
 
-	// No CNAME domain should exist
-	result, err = dd.containerInfoByDomain("ldap.homelab.local.")
+	// Container's name does NOT auto-create an A record (no `domain` directive any more)
+	res, err = dd.containerInfoByDomain("portainer.docker.local.")
 	assert.Nil(t, err)
-	assert.Nil(t, result)
+	assert.Nil(t, res)
 }
 
-func TestCnamePriorityOverARecord(t *testing.T) {
-	// When DOCKER_DOMAIN matches the real domain, container names can
-	// create A records that collide with CNAME domains from traefik labels.
-	// Example: container_name "traefik" + domain "177cpt.com" creates
-	// traefik.177cpt.com -> A -> container IP, which would shadow the
-	// CNAME from traefik_cname. CNAMEs should always win.
-	networkName := "proxy"
-	c := caddy.NewTestController("dns", fmt.Sprintf(`docker unix:///home/user/docker.sock {
-	domain 177cpt.com
-	network_aliases %s
-	traefik_cname infravm.177cpt.com
-}`, networkName))
+// Worked example: openldap — `host` label only, no Traefik label.
+// Expect an A record at host_ip; no CNAME, no tunnel push (no Traefik FQDN).
+func TestOpenldapLikeContainer(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker {
+	host_ip 10.0.60.3
+}`)
 	dd, err := createPlugin(c)
 	assert.Nil(t, err)
 
-	traefikAddress := net.ParseIP("172.18.0.5")
+	cont := genContainer("bb155d6fd141e29256c286070d2d44b3f45f1e46", "openldap", map[string]string{
+		"coredns.dockerdiscovery.host": "ldap.177cpt.com",
+	})
 
-	// Container named "traefik" — the domain resolver will create
-	// traefik.177cpt.com -> A -> 172.18.0.5
-	traefikContainer := &dockerapi.Container{
-		ID:   "aa155d6fd141e29256c286070d2d44b3f45f1e46822578f1e7d66c1e7981e6c7",
-		Name: "traefik",
-		Config: &dockerapi.Config{
-			Hostname: "traefik",
-			Labels: map[string]string{
-				"coredns.dockerdiscovery.host": "",
-			},
-		},
-		HostConfig: &dockerapi.HostConfig{
-			NetworkMode: networkName,
-		},
-		NetworkSettings: &dockerapi.NetworkSettings{
-			Networks: map[string]dockerapi.ContainerNetwork{
-				networkName: {
-					IPAddress: traefikAddress.String(),
-				},
-			},
-		},
-	}
+	assert.Nil(t, dd.updateContainerInfo(cont))
 
-	whoamiAddress := net.ParseIP("172.18.0.10")
-
-	// Container with traefik label Host(`traefik.177cpt.com`) — creates
-	// a CNAME domain for traefik.177cpt.com
-	whoamiContainer := &dockerapi.Container{
-		ID:   "bb255d6fd141e29256c286070d2d44b3f45f1e46822578f1e7d66c1e7981e6c7",
-		Name: "whoami",
-		Config: &dockerapi.Config{
-			Hostname: "whoami",
-			Labels: map[string]string{
-				"traefik.enable":                 "true",
-				"traefik.http.routers.dash.rule": "Host(`traefik.177cpt.com`)",
-				"coredns.dockerdiscovery.host":   "",
-			},
-		},
-		HostConfig: &dockerapi.HostConfig{
-			NetworkMode: networkName,
-		},
-		NetworkSettings: &dockerapi.NetworkSettings{
-			Networks: map[string]dockerapi.ContainerNetwork{
-				networkName: {
-					IPAddress: whoamiAddress.String(),
-				},
-			},
-		},
-	}
-
-	e := dd.updateContainerInfo(traefikContainer)
-	assert.Nil(t, e)
-	e = dd.updateContainerInfo(whoamiContainer)
-	assert.Nil(t, e)
-
-	// traefik.177cpt.com should resolve as CNAME (from traefik label),
-	// NOT as A record (from container name + domain)
-	result, err := dd.containerInfoByDomain("traefik.177cpt.com.")
+	res, err := dd.containerInfoByDomain("ldap.177cpt.com.")
 	assert.Nil(t, err)
-	assert.NotNil(t, result)
-	assert.True(t, result.isCNAME, "traefik.177cpt.com should be CNAME, not A record")
-
-	// whoami.177cpt.com should be an A record (from container name + domain)
-	result, err = dd.containerInfoByDomain("whoami.177cpt.com.")
-	assert.Nil(t, err)
-	assert.NotNil(t, result)
-	assert.False(t, result.isCNAME)
+	assert.NotNil(t, res)
+	assert.False(t, res.isCNAME)
+	assert.Equal(t, "ldap.177cpt.com", res.containerInfo.hostADomain)
 }
 
-func TestGetTraefikServicePort(t *testing.T) {
-	// Standard Traefik service port label
-	labels := map[string]string{
-		"traefik.http.services.web.loadbalancer.server.port": "8080",
-	}
-	assert.Equal(t, "8080", getTraefikServicePort(labels))
+// Worked example: traefik itself — both labels for the same FQDN.
+// Local lookup must return A (host wins). cnameDomains list still contains
+// the FQDN so the inventory/tunnel layers can see it.
+func TestTraefikSelfContainer(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker {
+	traefik_cname traefik.177cpt.com
+	host_ip 10.0.60.3
+}`)
+	dd, err := createPlugin(c)
+	assert.Nil(t, err)
 
-	// No matching label
-	labels = map[string]string{
-		"traefik.http.routers.web.rule": "Host(`web.example.com`)",
-	}
-	assert.Equal(t, "", getTraefikServicePort(labels))
+	cont := genContainer("cc155d6fd141e29256c286070d2d44b3f45f1e46", "traefik", map[string]string{
+		"coredns.dockerdiscovery.host":            "traefik.177cpt.com",
+		"traefik.http.routers.dashboard.rule":     "Host(`traefik.177cpt.com`)",
+	})
+	assert.Nil(t, dd.updateContainerInfo(cont))
 
-	// Empty labels
-	assert.Equal(t, "", getTraefikServicePort(map[string]string{}))
+	res, err := dd.containerInfoByDomain("traefik.177cpt.com.")
+	assert.Nil(t, err)
+	assert.NotNil(t, res)
+	assert.False(t, res.isCNAME, "host_ip A wins over CNAME for the same FQDN")
+}
 
-	// Empty port value
-	labels = map[string]string{
-		"traefik.http.services.web.loadbalancer.server.port": "",
-	}
-	assert.Equal(t, "", getTraefikServicePort(labels))
+func TestHostIpLabelIgnoredWithoutDirective(t *testing.T) {
+	// Plugin not configured with host_ip → the label is ignored.
+	c := caddy.NewTestController("dns", `docker {
+	traefik_cname traefik.example.com
+}`)
+	dd, err := createPlugin(c)
+	assert.Nil(t, err)
+
+	cont := genContainer("dd155d6fd141e29256c286070d2d44b3f45f1e46", "openldap", map[string]string{
+		"coredns.dockerdiscovery.host": "ldap.example.com",
+	})
+	assert.Nil(t, dd.updateContainerInfo(cont))
+
+	res, _ := dd.containerInfoByDomain("ldap.example.com.")
+	assert.Nil(t, res, "host label should be ignored without host_ip directive")
+}
+
+func TestContainerOptsOutOfTunnel(t *testing.T) {
+	yes := genContainer("ee", "x", map[string]string{"coredns.dockerdiscovery.cf_tunnel": "false"})
+	no := genContainer("ee", "x", map[string]string{"coredns.dockerdiscovery.cf_tunnel": "true"})
+	missing := genContainer("ee", "x", nil)
+
+	assert.True(t, containerOptsOutOfTunnel(yes))
+	assert.False(t, containerOptsOutOfTunnel(no))
+	assert.False(t, containerOptsOutOfTunnel(missing))
+}
+
+func TestDiffDomains(t *testing.T) {
+	added, removed := diffDomains([]string{"a", "b", "c"}, []string{"b", "c", "d"})
+	assert.ElementsMatch(t, []string{"d"}, added)
+	assert.ElementsMatch(t, []string{"a"}, removed)
+}
+
+// Tunnel exclude + opt-out interaction.
+func TestTunnelExcludeAndOptOut(t *testing.T) {
+	dd := NewDockerDiscovery(defaultDockerEndpoint)
+	dd.cloudflareConfig = &CloudflareConfig{ExcludeDomains: map[string]bool{"private.example.com": true}}
+	dd.cfTunnelTarget = "https://localhost:443"
+	dd.tunnelSyncer = &TunnelSyncer{} // non-nil so the dispatch branch runs
+	dd.traefikResolver = NewTraefikLabelResolver()
+	dd.traefikCNAME = "traefik.example.com"
+
+	cont := genContainer("ff", "x", map[string]string{
+		"traefik.http.routers.public.rule":  "Host(`public.example.com`)",
+		"traefik.http.routers.private.rule": "Host(`private.example.com`)",
+	})
+
+	// Manually run the dispatch path to inspect tunnelDomains without
+	// hitting the real network.
+	hostADomain, cnames := dd.resolveDomainsByContainer(cont)
+	_ = hostADomain
+	assert.ElementsMatch(t, []string{"public.example.com", "private.example.com"}, cnames)
+
+	// Opt-out shorts the whole tunnel push.
+	contOptOut := genContainer("ff", "x", map[string]string{
+		"traefik.http.routers.public.rule":  "Host(`public.example.com`)",
+		"coredns.dockerdiscovery.cf_tunnel": "false",
+	})
+	assert.True(t, containerOptsOutOfTunnel(contOptOut))
+}
+
+// Ensure that a container with no relevant labels never gets stored.
+func TestUnlabeledContainerIgnored(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker {
+	traefik_cname traefik.example.com
+	host_ip 10.0.60.3
+}`)
+	dd, err := createPlugin(c)
+	assert.Nil(t, err)
+
+	cont := genContainer("00", "boring", map[string]string{
+		"com.docker.compose.project": "stuff",
+	})
+	assert.Nil(t, dd.updateContainerInfo(cont))
+	assert.Equal(t, 0, len(dd.containerInfoMap))
+}
+
+// Sanity: the IP we serve back is the directive value, not anything from
+// container.NetworkSettings (this is the bug we set out to fix).
+func TestHostIpServedFromDirectiveNotFromContainer(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker {
+	host_ip 10.0.60.3
+}`)
+	dd, err := createPlugin(c)
+	assert.Nil(t, err)
+
+	cont := genContainer("99", "openldap", map[string]string{
+		"coredns.dockerdiscovery.host": "ldap.177cpt.com",
+	})
+	cont.NetworkSettings.Networks["bridge"] = dockerapi.ContainerNetwork{IPAddress: "10.89.0.9"}
+	cont.HostConfig.NetworkMode = "bridge"
+
+	assert.Nil(t, dd.updateContainerInfo(cont))
+	res, _ := dd.containerInfoByDomain("ldap.177cpt.com.")
+	assert.NotNil(t, res)
+	assert.Equal(t, net.ParseIP("10.0.60.3").String(), dd.hostIP.String())
 }

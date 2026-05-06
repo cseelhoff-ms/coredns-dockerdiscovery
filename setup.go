@@ -16,7 +16,6 @@ import (
 )
 
 const defaultDockerEndpoint = "unix:///var/run/docker.sock"
-const defaultDockerDomain = "docker.local"
 
 func init() {
 	caddy.RegisterPlugin("docker", caddy.Plugin{
@@ -25,97 +24,56 @@ func init() {
 	})
 }
 
-// TODO(kevinjqiu): add docker endpoint verification
+// createPlugin parses a single `docker` block.
+//
+// Supported directives (full set):
+//
+//	docker [DOCKER_ENDPOINT] {
+//	    traefik_cname    HOSTNAME      # CNAME target for Traefik FQDNs
+//	    host_ip          IP            # LAN-facing host IP for `host` label
+//	    ttl              SECONDS
+//	    cf_token         TOKEN
+//	    cf_email         EMAIL
+//	    cf_key           KEY
+//	    cf_tunnel_id     UUID
+//	    cf_account_id    ID
+//	    cf_tunnel_target URL           # backend service URL pushed for every Traefik FQDN
+//	    cf_exclude       a.com,b.com   # comma-separated FQDNs to skip from tunnel sync
+//	    inventory        ADDR [PATH]
+//	}
 func createPlugin(c *caddy.Controller) (*DockerDiscovery, error) {
 	dd := NewDockerDiscovery(defaultDockerEndpoint)
-	labelResolver := &LabelResolver{hostLabel: "coredns.dockerdiscovery.host"}
-	dd.resolvers = append(dd.resolvers, labelResolver)
 
 	for c.Next() {
 		args := c.RemainingArgs()
 		if len(args) == 1 && args[0] != "" {
 			dd.dockerEndpoint = args[0]
 		}
-
 		if len(args) > 1 {
 			return dd, c.ArgErr()
 		}
 
 		for c.NextBlock() {
-			var value = c.Val()
+			value := c.Val()
 			switch value {
-			case "domain":
-				var resolver = &SubDomainContainerNameResolver{
-					domain: defaultDockerDomain,
-				}
-				dd.resolvers = append(dd.resolvers, resolver)
-				if !c.NextArg() || c.Val() == "" {
-					// Keep default domain
-					continue
-				}
-				resolver.domain = c.Val()
-			case "hostname_domain":
-				var resolver = &SubDomainHostResolver{
-					domain: defaultDockerDomain,
-				}
-				dd.resolvers = append(dd.resolvers, resolver)
-				if !c.NextArg() {
-					return dd, c.ArgErr()
-				}
-				resolver.domain = c.Val()
-			case "compose_domain":
-				var resolver = &ComposeResolver{
-					domain: defaultDockerDomain,
-				}
-				dd.resolvers = append(dd.resolvers, resolver)
-				if !c.NextArg() {
-					return dd, c.ArgErr()
-				}
-				resolver.domain = c.Val()
-			case "network_aliases":
-				var resolver = &NetworkAliasesResolver{
-					network: "",
-				}
-				dd.resolvers = append(dd.resolvers, resolver)
-				if !c.NextArg() {
-					return dd, c.ArgErr()
-				}
-				resolver.network = c.Val()
-			case "label":
-				if !c.NextArg() {
-					return dd, c.ArgErr()
-				}
-				labelResolver.hostLabel = c.Val()
-			case "cname_target":
-				if !c.NextArg() || c.Val() == "" {
-					// Skip — CNAME_TARGET env var not set
-					continue
-				}
-				dd.traefikCNAME = c.Val()
-				dd.cnameResolvers = append(dd.cnameResolvers, &LabelResolver{hostLabel: "coredns.dockerdiscovery.hostname"})
 			case "traefik_cname":
 				if !c.NextArg() || c.Val() == "" {
-					// Skip — TRAEFIK_HOST env var not set
 					continue
-				}
-				if dd.traefikA != nil {
-					return dd, c.Err("traefik_cname and traefik_a are mutually exclusive")
 				}
 				dd.traefikCNAME = c.Val()
 				dd.traefikResolver = NewTraefikLabelResolver()
-			case "traefik_a":
-				if !c.NextArg() {
-					return dd, c.ArgErr()
-				}
-				if dd.traefikCNAME != "" {
-					return dd, c.Err("traefik_cname and traefik_a are mutually exclusive")
+
+			case "host_ip":
+				if !c.NextArg() || c.Val() == "" {
+					continue
 				}
 				ip := net.ParseIP(c.Val())
 				if ip == nil {
-					return dd, c.Errf("invalid IP address for traefik_a: '%s'", c.Val())
+					return dd, c.Errf("invalid IP for host_ip: '%s'", c.Val())
 				}
-				dd.traefikA = ip
-				dd.traefikResolver = NewTraefikLabelResolver()
+				dd.hostIP = ip
+				dd.hostResolver = &LabelResolver{hostLabel: "coredns.dockerdiscovery.host"}
+
 			case "ttl":
 				if !c.NextArg() {
 					return dd, c.ArgErr()
@@ -127,15 +85,16 @@ func createPlugin(c *caddy.Controller) (*DockerDiscovery, error) {
 				if ttl > 0 {
 					dd.ttl = uint32(ttl)
 				}
+
 			case "cf_token":
 				if dd.cloudflareConfig == nil {
 					dd.cloudflareConfig = &CloudflareConfig{ExcludeDomains: make(map[string]bool)}
 				}
 				if !c.NextArg() || c.Val() == "" {
-					// Skip — CF_TOKEN env var not set
 					continue
 				}
 				dd.cloudflareConfig.APIToken = c.Val()
+
 			case "cf_email":
 				if dd.cloudflareConfig == nil {
 					dd.cloudflareConfig = &CloudflareConfig{ExcludeDomains: make(map[string]bool)}
@@ -144,6 +103,7 @@ func createPlugin(c *caddy.Controller) (*DockerDiscovery, error) {
 					continue
 				}
 				dd.cloudflareConfig.APIEmail = c.Val()
+
 			case "cf_key":
 				if dd.cloudflareConfig == nil {
 					dd.cloudflareConfig = &CloudflareConfig{ExcludeDomains: make(map[string]bool)}
@@ -152,32 +112,7 @@ func createPlugin(c *caddy.Controller) (*DockerDiscovery, error) {
 					continue
 				}
 				dd.cloudflareConfig.APIKey = c.Val()
-			case "cf_target":
-				if dd.cloudflareConfig == nil {
-					dd.cloudflareConfig = &CloudflareConfig{ExcludeDomains: make(map[string]bool)}
-				}
-				if !c.NextArg() || c.Val() == "" {
-					continue
-				}
-				dd.cloudflareConfig.TargetDomain = c.Val()
-			case "cf_zone":
-				if dd.cloudflareConfig == nil {
-					dd.cloudflareConfig = &CloudflareConfig{ExcludeDomains: make(map[string]bool)}
-				}
-				args := c.RemainingArgs()
-				if len(args) != 2 || args[0] == "" || args[1] == "" {
-					// Skip — CF_ZONE_DOMAIN or CF_ZONE_ID not set
-					continue
-				}
-				dd.cloudflareConfig.Zones = append(dd.cloudflareConfig.Zones, CloudflareZone{
-					Domain: args[0],
-					ZoneID: args[1],
-				})
-			case "cf_proxied":
-				if dd.cloudflareConfig == nil {
-					dd.cloudflareConfig = &CloudflareConfig{ExcludeDomains: make(map[string]bool)}
-				}
-				dd.cloudflareConfig.Proxied = true
+
 			case "cf_exclude":
 				if dd.cloudflareConfig == nil {
 					dd.cloudflareConfig = &CloudflareConfig{ExcludeDomains: make(map[string]bool)}
@@ -191,6 +126,7 @@ func createPlugin(c *caddy.Controller) (*DockerDiscovery, error) {
 						dd.cloudflareConfig.ExcludeDomains[d] = true
 					}
 				}
+
 			case "cf_tunnel_id":
 				if dd.tunnelConfig == nil {
 					dd.tunnelConfig = &TunnelConfig{}
@@ -199,6 +135,7 @@ func createPlugin(c *caddy.Controller) (*DockerDiscovery, error) {
 					continue
 				}
 				dd.tunnelConfig.TunnelID = c.Val()
+
 			case "cf_account_id":
 				if dd.tunnelConfig == nil {
 					dd.tunnelConfig = &TunnelConfig{}
@@ -207,51 +144,52 @@ func createPlugin(c *caddy.Controller) (*DockerDiscovery, error) {
 					continue
 				}
 				dd.tunnelConfig.AccountID = c.Val()
+
+			case "cf_tunnel_target":
+				if !c.NextArg() || c.Val() == "" {
+					continue
+				}
+				dd.cfTunnelTarget = c.Val()
+
 			case "inventory":
 				if !c.NextArg() || c.Val() == "" {
-					// Skip — INVENTORY_ADDR env var not set
 					continue
 				}
 				dd.inventoryAddr = c.Val()
 				if c.NextArg() && c.Val() != "" {
 					dd.inventoryPath = c.Val()
 				}
+
 			default:
 				return dd, c.Errf("unknown property: '%s'", c.Val())
 			}
 		}
 	}
 
-	// Cloudflare Tunnel initialization — only if fully configured
+	// Cloudflare Tunnel initialization. Tunnel sync is the only Cloudflare-
+	// side feature this plugin supports; no DNS records are created in
+	// Cloudflare. Public DNS for tunnel hostnames is handled separately.
 	if dd.tunnelConfig != nil {
 		hasTunnelID := dd.tunnelConfig.TunnelID != ""
 		hasAccountID := dd.tunnelConfig.AccountID != ""
 
 		if hasTunnelID && hasAccountID {
-			// Tunnel requires Cloudflare credentials + zones
 			if dd.cloudflareConfig == nil {
-				return dd, fmt.Errorf("tunnel: cf_tunnel_id requires cf_token (or cf_key + cf_email) and cf_zone")
+				return dd, fmt.Errorf("tunnel: cf_tunnel_id requires cf_token (or cf_key + cf_email)")
 			}
 			hasCredentials := dd.cloudflareConfig.APIToken != "" || (dd.cloudflareConfig.APIKey != "" && dd.cloudflareConfig.APIEmail != "")
-			hasZones := len(dd.cloudflareConfig.Zones) > 0
-			if !hasCredentials || !hasZones {
-				var missing []string
-				if !hasCredentials {
-					missing = append(missing, "cf_token (or cf_key + cf_email)")
-				}
-				if !hasZones {
-					missing = append(missing, "cf_zone")
-				}
-				return dd, fmt.Errorf("tunnel: cf_tunnel_id requires %s", strings.Join(missing, ", "))
+			if !hasCredentials {
+				return dd, fmt.Errorf("tunnel: cf_tunnel_id requires cf_token (or cf_key + cf_email)")
+			}
+			if dd.cfTunnelTarget == "" {
+				return dd, fmt.Errorf("tunnel: cf_tunnel_target is required when cf_tunnel_id is set")
 			}
 
-			// Auto-enable traefik resolver if not already configured
-			if dd.traefikResolver == nil {
-				if dd.cloudflareConfig.TargetDomain != "" {
-					dd.traefikCNAME = dd.cloudflareConfig.TargetDomain
-				} else {
-					dd.traefikCNAME = fmt.Sprintf("%s.cfargotunnel.com", dd.tunnelConfig.TunnelID)
-				}
+			// If the operator didn't pick a CNAME target, default to the
+			// tunnel's own cfargotunnel.com hostname so LAN clients still
+			// reach the tunnel.
+			if dd.traefikCNAME == "" {
+				dd.traefikCNAME = fmt.Sprintf("%s.cfargotunnel.com", dd.tunnelConfig.TunnelID)
 				dd.traefikResolver = NewTraefikLabelResolver()
 			}
 
@@ -260,7 +198,7 @@ func createPlugin(c *caddy.Controller) (*DockerDiscovery, error) {
 				return dd, err
 			}
 			dd.tunnelSyncer = tunnelSyncer
-			log.Printf("[docker] Cloudflare Tunnel syncer enabled for tunnel %s", dd.tunnelConfig.TunnelID)
+			log.Printf("[docker] Cloudflare Tunnel syncer enabled for tunnel %s (target=%s)", dd.tunnelConfig.TunnelID, dd.cfTunnelTarget)
 		} else if hasTunnelID || hasAccountID {
 			var missing []string
 			if !hasTunnelID {
@@ -271,42 +209,6 @@ func createPlugin(c *caddy.Controller) (*DockerDiscovery, error) {
 			}
 			return dd, fmt.Errorf("tunnel: incomplete configuration, missing: %s", strings.Join(missing, ", "))
 		}
-	}
-
-	// Cloudflare DNS sync initialization — only if fully configured
-	if dd.cloudflareConfig != nil {
-		// Check if Cloudflare was actually configured (has credentials + target + zones)
-		hasCredentials := dd.cloudflareConfig.APIToken != "" || (dd.cloudflareConfig.APIKey != "" && dd.cloudflareConfig.APIEmail != "")
-		hasTarget := dd.cloudflareConfig.TargetDomain != ""
-		hasZones := len(dd.cloudflareConfig.Zones) > 0
-
-		if hasCredentials && hasTarget && hasZones {
-			// Auto-enable traefik resolver if not already configured
-			if dd.traefikResolver == nil {
-				dd.traefikCNAME = dd.cloudflareConfig.TargetDomain
-				dd.traefikResolver = NewTraefikLabelResolver()
-			}
-
-			syncer, err := NewCloudflareSyncer(dd.cloudflareConfig)
-			if err != nil {
-				return dd, err
-			}
-			dd.cloudflareSyncer = syncer
-		} else if dd.tunnelSyncer == nil && (hasCredentials || hasTarget || hasZones) {
-			// Partially configured — warn about what's missing (only when no tunnel syncer)
-			var missing []string
-			if !hasCredentials {
-				missing = append(missing, "cf_token (or cf_key + cf_email)")
-			}
-			if !hasTarget {
-				missing = append(missing, "cf_target")
-			}
-			if !hasZones {
-				missing = append(missing, "cf_zone")
-			}
-			return dd, fmt.Errorf("cloudflare: incomplete configuration, missing: %s", strings.Join(missing, ", "))
-		}
-		// If nothing meaningful was set (all empty from unset env vars), silently skip
 	}
 
 	dockerClient, err := dockerapi.NewClient(dd.dockerEndpoint)
@@ -328,6 +230,11 @@ func setup(c *caddy.Controller) error {
 		return err
 	}
 
+	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
+		dd.Next = next
+		return dd
+	})
+
 	if dd.inventoryAddr != "" {
 		dd.inventoryServer = NewInventoryServer(dd.inventoryAddr, dd.inventoryPath, dd)
 		c.OnStartup(func() error {
@@ -338,9 +245,5 @@ func setup(c *caddy.Controller) error {
 		})
 	}
 
-	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
-		dd.Next = next
-		return dd
-	})
 	return nil
 }
