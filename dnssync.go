@@ -58,6 +58,7 @@ func (s *DNSSyncer) AddRecords(hostnames []string) {
 	if len(hostnames) == 0 {
 		return
 	}
+	log.Printf("[dns] AddRecords zone=%s target=%s hostnames=%v", s.zoneID, s.cnameTo, hostnames)
 	ctx := context.Background()
 	proxied := true
 
@@ -74,6 +75,7 @@ func (s *DNSSyncer) AddRecords(hostnames []string) {
 		}
 
 		if existing == nil {
+			log.Printf("[dns] %s: no existing record found, creating proxied CNAME", hostname)
 			rec, err := s.api.CreateDNSRecord(ctx, s.zoneID, cloudflare.CreateDNSRecordParams{
 				Type:    "CNAME",
 				Name:    hostname,
@@ -87,8 +89,12 @@ func (s *DNSSyncer) AddRecords(hostnames []string) {
 				continue
 			}
 			log.Printf("[dns] Created CNAME %s -> %s (id=%s)", hostname, s.cnameTo, rec.ID)
+			s.verifyRecord(ctx, hostname, rec.ID, "create")
 			continue
 		}
+
+		log.Printf("[dns] %s: existing record id=%s type=%s content=%s comment=%q proxied=%v",
+			hostname, existing.ID, existing.Type, existing.Content, existing.Comment, derefBool(existing.Proxied))
 
 		// Found an existing record. Only touch it if we own it.
 		if existing.Comment != dnsRecordOwnerComment {
@@ -102,6 +108,7 @@ func (s *DNSSyncer) AddRecords(hostnames []string) {
 			existing.Proxied == nil || !*existing.Proxied
 
 		if !needsUpdate {
+			log.Printf("[dns] %s: owned record already in canonical state, no update needed", hostname)
 			continue
 		}
 
@@ -120,6 +127,7 @@ func (s *DNSSyncer) AddRecords(hostnames []string) {
 			continue
 		}
 		log.Printf("[dns] Updated CNAME %s -> %s (id=%s)", hostname, s.cnameTo, existing.ID)
+		s.verifyRecord(ctx, hostname, existing.ID, "update")
 	}
 }
 
@@ -132,6 +140,7 @@ func (s *DNSSyncer) RemoveRecords(hostnames []string) {
 	if len(hostnames) == 0 {
 		return
 	}
+	log.Printf("[dns] RemoveRecords zone=%s hostnames=%v", s.zoneID, hostnames)
 	ctx := context.Background()
 
 	for _, hostname := range hostnames {
@@ -179,4 +188,33 @@ func (s *DNSSyncer) findRecord(ctx context.Context, hostname string) (*cloudflar
 		}
 	}
 	return &records[0], nil
+}
+
+// verifyRecord re-reads the named record from Cloudflare immediately
+// after a write so the server-side state shows up in the logs. This
+// catches silent-success-but-wrong-zone or silent-success-but-bad-data
+// cases that wouldn't otherwise surface until DNS resolution failed.
+func (s *DNSSyncer) verifyRecord(ctx context.Context, hostname, expectedID, op string) {
+	rec, err := s.findRecord(ctx, hostname)
+	if err != nil {
+		log.Printf("[dns] verify(%s) %s: lookup failed: %s", op, hostname, err)
+		return
+	}
+	if rec == nil {
+		log.Printf("[dns] verify(%s) %s: WARN no record found server-side after %s", op, hostname, op)
+		return
+	}
+	if rec.ID != expectedID {
+		log.Printf("[dns] verify(%s) %s: id mismatch (wrote=%s, server=%s) — possible duplicate",
+			op, hostname, expectedID, rec.ID)
+	}
+	log.Printf("[dns] verify(%s) %s: id=%s type=%s content=%s proxied=%v comment=%q",
+		op, hostname, rec.ID, rec.Type, rec.Content, derefBool(rec.Proxied), rec.Comment)
+}
+
+func derefBool(p *bool) bool {
+	if p == nil {
+		return false
+	}
+	return *p
 }

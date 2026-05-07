@@ -288,7 +288,10 @@ func (dd *DockerDiscovery) updateContainerInfo(container *dockerapi.Container) e
 				dd.tunnelSyncer.AddRoutes(doms, target)
 			}()
 			if dd.dnsSyncer != nil {
+				log.Printf("[docker] dns sync container=%s add domains=%v", cid, doms)
 				go dd.dnsSyncer.AddRecords(doms)
+			} else {
+				log.Printf("[docker] dns sync SKIPPED for container=%s domains=%v (cf_zone_id not set)", cid, doms)
 			}
 		}
 	}

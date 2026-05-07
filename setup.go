@@ -4,8 +4,12 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/coredns/coredns/core/dnsserver"
 	"github.com/coredns/coredns/plugin"
@@ -16,6 +20,33 @@ import (
 )
 
 const defaultDockerEndpoint = "unix:///var/run/docker.sock"
+
+// logVersionOnce prints a single startup banner with the compiled-in
+// pluginVersion plus runtime/debug info, so when an operator pastes
+// logs we can be sure which build they're on.
+var logVersionOnce sync.Once
+
+func logBuildVersion() {
+	logVersionOnce.Do(func() {
+		vcsRev, vcsTime, vcsModified := "unknown", "unknown", ""
+		if info, ok := debug.ReadBuildInfo(); ok {
+			for _, s := range info.Settings {
+				switch s.Key {
+				case "vcs.revision":
+					vcsRev = s.Value
+				case "vcs.time":
+					vcsTime = s.Value
+				case "vcs.modified":
+					if s.Value == "true" {
+						vcsModified = " (dirty)"
+					}
+				}
+			}
+		}
+		log.Printf("[docker] coredns-dockerdiscovery version=%s go=%s vcs=%s%s vcs_time=%s started_at=%s",
+			pluginVersion, runtime.Version(), vcsRev, vcsModified, vcsTime, time.Now().UTC().Format(time.RFC3339))
+	})
+}
 
 func init() {
 	caddy.RegisterPlugin("docker", caddy.Plugin{
@@ -43,6 +74,7 @@ func init() {
 //	    inventory        ADDR [PATH]
 //	}
 func createPlugin(c *caddy.Controller) (*DockerDiscovery, error) {
+	logBuildVersion()
 	dd := NewDockerDiscovery(defaultDockerEndpoint)
 
 	for c.Next() {
@@ -219,6 +251,9 @@ func createPlugin(c *caddy.Controller) (*DockerDiscovery, error) {
 				if dd.dnsSyncer != nil {
 					log.Printf("[docker] Cloudflare DNS syncer enabled for zone %s -> %s.cfargotunnel.com", dd.cloudflareConfig.ZoneID, dd.tunnelConfig.TunnelID)
 				}
+			} else {
+				log.Printf("[docker] Cloudflare DNS syncer DISABLED: cf_zone_id is not set. " +
+					"Set cf_zone_id (or CF_ZONE_ID env var) to auto-create proxied CNAMEs alongside tunnel ingress.")
 			}
 		} else if hasTunnelID || hasAccountID {
 			var missing []string
