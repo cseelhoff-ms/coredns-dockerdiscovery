@@ -45,6 +45,13 @@ func NewTunnelSyncerWithAPI(tunnelCfg *TunnelConfig, cfCfg *CloudflareConfig, ap
 	}
 }
 
+// API returns the underlying Cloudflare API client. Exposed so the DNS
+// syncer can share the same authenticated client without each consumer
+// having to know the credential lookup rules.
+func (s *TunnelSyncer) API() CloudflareAPI {
+	return s.api
+}
+
 // AddRoutes adds public hostname ingress rules to the tunnel.
 func (s *TunnelSyncer) AddRoutes(hostnames []string, serviceURL string) {
 	s.mu.Lock()

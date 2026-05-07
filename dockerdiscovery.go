@@ -70,6 +70,11 @@ type DockerDiscovery struct {
 	tunnelConfig   *TunnelConfig
 	cfTunnelTarget string // backend service URL pushed for every Traefik FQDN
 
+	// Cloudflare DNS CNAME sync (optional; nil unless cf_zone_id is set).
+	// When configured we mirror the tunnel ingress entries as proxied
+	// CNAMEs to <tunnel-id>.cfargotunnel.com so public DNS resolves.
+	dnsSyncer *DNSSyncer
+
 	// Inventory HTTP endpoint
 	inventoryAddr   string
 	inventoryPath   string
@@ -224,6 +229,9 @@ func (dd *DockerDiscovery) updateContainerInfo(container *dockerapi.Container) e
 			if dd.tunnelSyncer != nil && len(prev.tunnelDomains) > 0 {
 				doms := append([]string(nil), prev.tunnelDomains...)
 				go dd.tunnelSyncer.RemoveRoutes(doms)
+				if dd.dnsSyncer != nil {
+					go dd.dnsSyncer.RemoveRecords(doms)
+				}
 			}
 		}
 		return nil
@@ -267,6 +275,9 @@ func (dd *DockerDiscovery) updateContainerInfo(container *dockerapi.Container) e
 		if len(toRemove) > 0 {
 			doms := append([]string(nil), toRemove...)
 			go dd.tunnelSyncer.RemoveRoutes(doms)
+			if dd.dnsSyncer != nil {
+				go dd.dnsSyncer.RemoveRecords(doms)
+			}
 		}
 		if len(toAdd) > 0 {
 			doms := append([]string(nil), toAdd...)
@@ -276,6 +287,9 @@ func (dd *DockerDiscovery) updateContainerInfo(container *dockerapi.Container) e
 				log.Printf("[docker] tunnel sync container=%s domains=%v target=%s", cid, doms, target)
 				dd.tunnelSyncer.AddRoutes(doms, target)
 			}()
+			if dd.dnsSyncer != nil {
+				go dd.dnsSyncer.AddRecords(doms)
+			}
 		}
 	}
 
@@ -297,6 +311,9 @@ func (dd *DockerDiscovery) removeContainerInfo(containerID string) error {
 	if dd.tunnelSyncer != nil && len(ci.tunnelDomains) > 0 {
 		doms := append([]string(nil), ci.tunnelDomains...)
 		go dd.tunnelSyncer.RemoveRoutes(doms)
+		if dd.dnsSyncer != nil {
+			go dd.dnsSyncer.RemoveRecords(doms)
+		}
 	}
 
 	log.Printf("[docker] Deleting entry %s (%s)", normalizeContainerName(ci.container), shortID(ci.container.ID))

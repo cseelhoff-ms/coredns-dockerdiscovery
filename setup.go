@@ -38,7 +38,8 @@ func init() {
 //	    cf_tunnel_id     UUID
 //	    cf_account_id    ID
 //	    cf_tunnel_target URL           # backend service URL pushed for every Traefik FQDN
-//	    cf_exclude       a.com,b.com   # comma-separated FQDNs to skip from tunnel sync
+//	    cf_zone_id       ZONE_ID       # optional; when set, mirrors tunnel ingress as proxied CNAMEs
+//	    cf_exclude       a.com,b.com   # comma-separated FQDNs to skip from tunnel + DNS sync
 //	    inventory        ADDR [PATH]
 //	}
 func createPlugin(c *caddy.Controller) (*DockerDiscovery, error) {
@@ -151,6 +152,15 @@ func createPlugin(c *caddy.Controller) (*DockerDiscovery, error) {
 				}
 				dd.cfTunnelTarget = c.Val()
 
+			case "cf_zone_id":
+				if dd.cloudflareConfig == nil {
+					dd.cloudflareConfig = &CloudflareConfig{ExcludeDomains: make(map[string]bool)}
+				}
+				if !c.NextArg() || c.Val() == "" {
+					continue
+				}
+				dd.cloudflareConfig.ZoneID = c.Val()
+
 			case "inventory":
 				if !c.NextArg() || c.Val() == "" {
 					continue
@@ -199,6 +209,17 @@ func createPlugin(c *caddy.Controller) (*DockerDiscovery, error) {
 			}
 			dd.tunnelSyncer = tunnelSyncer
 			log.Printf("[docker] Cloudflare Tunnel syncer enabled for tunnel %s (target=%s)", dd.tunnelConfig.TunnelID, dd.cfTunnelTarget)
+
+			// Optional: also create proxied CNAMEs in a Cloudflare zone so
+			// public DNS for tunnel hostnames resolves. The dashboard does
+			// this automatically when you add a public hostname; the API
+			// does not, so we have to do it ourselves.
+			if dd.cloudflareConfig.ZoneID != "" {
+				dd.dnsSyncer = NewDNSSyncer(tunnelSyncer.API(), dd.cloudflareConfig, dd.tunnelConfig.TunnelID)
+				if dd.dnsSyncer != nil {
+					log.Printf("[docker] Cloudflare DNS syncer enabled for zone %s -> %s.cfargotunnel.com", dd.cloudflareConfig.ZoneID, dd.tunnelConfig.TunnelID)
+				}
+			}
 		} else if hasTunnelID || hasAccountID {
 			var missing []string
 			if !hasTunnelID {

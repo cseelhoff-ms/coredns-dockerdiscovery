@@ -107,6 +107,41 @@ func TestTunnelMissingCredentials(t *testing.T) {
 	assert.Contains(t, err.Error(), "cf_token")
 }
 
+// cf_zone_id is optional. When present, the plugin parses it into the
+// CloudflareConfig where the DNS syncer can pick it up. Tunnel sync
+// must still succeed end-to-end (including DNSSyncer construction) so
+// we exercise the full createPlugin path.
+func TestCfZoneIdDirective(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker {
+	cf_token tk
+	cf_tunnel_id uuid
+	cf_account_id acct
+	cf_tunnel_target https://localhost:443
+	cf_zone_id zone123
+}`)
+	dd, err := createPlugin(c)
+	assert.Nil(t, err)
+	assert.NotNil(t, dd.cloudflareConfig)
+	assert.Equal(t, "zone123", dd.cloudflareConfig.ZoneID)
+	assert.NotNil(t, dd.dnsSyncer, "dnsSyncer should be constructed when cf_zone_id is set")
+	assert.Equal(t, "uuid.cfargotunnel.com", dd.dnsSyncer.cnameTo)
+}
+
+// Without cf_zone_id, dnsSyncer must remain nil even if the tunnel is
+// fully configured — preserving the safe default of "tunnel-only, no
+// DNS edits".
+func TestCfZoneIdAbsentMeansNoDNSSyncer(t *testing.T) {
+	c := caddy.NewTestController("dns", `docker {
+	cf_token tk
+	cf_tunnel_id uuid
+	cf_account_id acct
+	cf_tunnel_target https://localhost:443
+}`)
+	dd, err := createPlugin(c)
+	assert.Nil(t, err)
+	assert.Nil(t, dd.dnsSyncer)
+}
+
 // TraefikLabelResolver — covers the regex extraction across the supported
 // Traefik label families (http and tcp routers).
 func TestTraefikLabelResolver(t *testing.T) {
@@ -240,8 +275,8 @@ func TestTraefikSelfContainer(t *testing.T) {
 	assert.Nil(t, err)
 
 	cont := genContainer("cc155d6fd141e29256c286070d2d44b3f45f1e46", "traefik", map[string]string{
-		"coredns.dockerdiscovery.host":            "traefik.177cpt.com",
-		"traefik.http.routers.dashboard.rule":     "Host(`traefik.177cpt.com`)",
+		"coredns.dockerdiscovery.host":        "traefik.177cpt.com",
+		"traefik.http.routers.dashboard.rule": "Host(`traefik.177cpt.com`)",
 	})
 	assert.Nil(t, dd.updateContainerInfo(cont))
 

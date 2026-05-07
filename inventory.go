@@ -35,6 +35,7 @@ const (
 	RecordKindCNAME  RecordKind = "CNAME"
 	RecordKindHostA  RecordKind = "A_HOST"
 	RecordKindTunnel RecordKind = "TUNNEL"
+	RecordKindCFDNS  RecordKind = "CF_DNS"
 )
 
 // InventoryRecord is one logical DNS record served by this plugin.
@@ -100,6 +101,16 @@ func (dd *DockerDiscovery) Snapshot() InventorySnapshot {
 				Container:   name,
 				Source:      "docker:tunnel",
 			})
+			if dd.dnsSyncer != nil {
+				snap.Records = append(snap.Records, InventoryRecord{
+					Domain:      d,
+					Kind:        RecordKindCFDNS,
+					Target:      dd.dnsSyncer.cnameTo,
+					ContainerID: shortID(id),
+					Container:   name,
+					Source:      "docker:cf_dns",
+				})
+			}
 		}
 
 		// CNAME records for Traefik FQDNs. Suppressed when the same

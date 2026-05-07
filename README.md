@@ -8,14 +8,15 @@ Tunnel ingress rules.
 This is a heavily reduced fork of
 [kevinjqiu/coredns-dockerdiscovery](https://github.com/kevinjqiu/coredns-dockerdiscovery).
 Container-IP A records, compose-domain auto-naming, network aliases,
-hostname-domain rewriting, and direct Cloudflare DNS sync have all been
-removed. What remains is two record-emission modes plus an inventory
-HTTP endpoint:
+and hostname-domain rewriting have all been removed. What remains is
+two record-emission modes, an optional Cloudflare Tunnel ingress
+syncer, an optional Cloudflare DNS syncer, and an inventory HTTP
+endpoint:
 
-| Mode | Trigger | Local record | Tunnel record |
-|---|---|---|---|
-| **Traefik CNAME** | `traefik.http.routers.*.rule=Host(...)` label | CNAME → `traefik_cname` | hostname → `cf_tunnel_target` |
-| **Host A** | `coredns.dockerdiscovery.host=fqdn` label | A → `host_ip` | (none unless the same FQDN also has a Traefik label) |
+| Mode | Trigger | Local record | Tunnel ingress | Public DNS |
+|---|---|---|---|---|
+| **Traefik CNAME** | `traefik.http.routers.*.rule=Host(...)` label | CNAME → `traefik_cname` | hostname → `cf_tunnel_target` | proxied CNAME → `<tunnel-id>.cfargotunnel.com` (when `cf_zone_id` is set) |
+| **Host A** | `coredns.dockerdiscovery.host=fqdn` label | A → `host_ip` | (none unless the same FQDN also has a Traefik label) | (same as above when paired with a Traefik label) |
 
 For containers without a `host` label, the local CNAME chases through
 to the host A record so LAN clients reach the host directly.
@@ -45,6 +46,7 @@ services:
       CF_TUNNEL_ID: ${CF_TUNNEL_ID}
       CF_ACCOUNT_ID: ${CF_ACCOUNT_ID}
       CF_TUNNEL_TARGET: https://localhost:443
+      CF_ZONE_ID: ${CF_ZONE_ID}            # optional; enables proxied-CNAME DNS sync
       INVENTORY_ADDR: ":8081"
       FORWARD_DNS: 1.1.1.1 8.8.8.8
       CACHE_TTL: "30"
@@ -94,6 +96,7 @@ docker [DOCKER_ENDPOINT] {
     cf_tunnel_id     UUID
     cf_account_id    ID
     cf_tunnel_target URL
+    cf_zone_id       ZONE_ID        # optional; enables Cloudflare DNS sync
     cf_exclude       fqdn1,fqdn2
     inventory        ADDR [PATH]
 }
@@ -105,11 +108,12 @@ docker [DOCKER_ENDPOINT] {
 | `traefik_cname HOSTNAME` | CNAME target served for every FQDN extracted from `traefik.http.routers.*.rule` and `traefik.tcp.routers.*.rule` labels. |
 | `host_ip IP` | LAN-facing host IP. Containers carrying `coredns.dockerdiscovery.host=<fqdn>` get an A record `<fqdn>` → `IP`. |
 | `ttl SECONDS` | Record TTL. Default `3600`. |
-| `cf_token` / `cf_email` + `cf_key` | Cloudflare credentials. Scoped API token preferred. Used solely by the Cloudflare Tunnel ingress syncer; this plugin does **not** create Cloudflare DNS records. |
+| `cf_token` / `cf_email` + `cf_key` | Cloudflare credentials. Scoped API token preferred. Used by the Cloudflare Tunnel ingress syncer and (when `cf_zone_id` is set) the Cloudflare DNS syncer. |
 | `cf_tunnel_id UUID` | Cloudflare Tunnel UUID. Required for tunnel sync. |
 | `cf_account_id ID` | Cloudflare Account ID. Required for tunnel sync. |
 | `cf_tunnel_target URL` | Backend service URL pushed as the ingress entry for every Traefik FQDN (e.g. `https://localhost:443` for a co-located Traefik). Required when `cf_tunnel_id` is set. |
-| `cf_exclude fqdn,...` | Comma-separated FQDNs to skip from tunnel sync. |
+| `cf_zone_id ZONE_ID` | Optional. When set, mirrors the tunnel ingress as proxied CNAMEs in this zone, pointing at `<tunnel-id>.cfargotunnel.com`. Replaces the manual CNAME step the Cloudflare dashboard does for you. See [Cloudflare DNS sync](#cloudflare-dns-sync) below. |
+| `cf_exclude fqdn,...` | Comma-separated FQDNs to skip from tunnel sync **and** DNS sync. |
 | `inventory ADDR [PATH]` | Start the inventory HTTP server on `ADDR` (e.g. `:8081`). JSON at `PATH` (default `/inventory`); HTML at `<PATH>.html`; `/healthz` always served. |
 
 Container labels
@@ -142,6 +146,7 @@ Anything else can be expressed by mounting a custom Corefile.
 | `CF_TUNNEL_ID` | *(none)* | Sets `cf_tunnel_id`. |
 | `CF_ACCOUNT_ID` | *(none)* | Sets `cf_account_id`. |
 | `CF_TUNNEL_TARGET` | *(none)* | Sets `cf_tunnel_target`. |
+| `CF_ZONE_ID` | *(none)* | Sets `cf_zone_id`. Enables Cloudflare DNS sync when non-empty. |
 | `CF_EXCLUDE` | *(none)* | Sets `cf_exclude`. |
 | `INVENTORY_ADDR` | *(none)* | Sets `inventory ADDR`. |
 | `INVENTORY_PATH` | *(none)* | Optional second arg to `inventory`. |
@@ -154,7 +159,8 @@ Inventory HTTP endpoint
 When `inventory` (or `INVENTORY_ADDR`) is set, the plugin starts a
 small HTTP server exposing the live in-memory record table. Each row
 carries source attribution (`docker:host_a`, `docker:cname`,
-`docker:tunnel`) so you can tell which directive produced it.
+`docker:tunnel`, `docker:cf_dns`) so you can tell which directive
+produced it.
 
 | Path | Content-Type | Description |
 |---|---|---|
@@ -182,12 +188,16 @@ JSON shape:
       "source": "docker:cname" },
     { "domain": "portainer.177cpt.com", "kind": "TUNNEL", "target": "https://localhost:443",
       "container_id": "0a1b2c3d4e5f", "container": "portainer",
-      "source": "docker:tunnel" }
+      "source": "docker:tunnel" },
+    { "domain": "portainer.177cpt.com", "kind": "CF_DNS", "target": "5c4fccc8-6376-479b-8131-7cd8cc033473.cfargotunnel.com",
+      "container_id": "0a1b2c3d4e5f", "container": "portainer",
+      "source": "docker:cf_dns" }
   ]
 }
 ```
 
-`kind` is one of `A_HOST`, `CNAME`, or `TUNNEL`.
+`kind` is one of `A_HOST`, `CNAME`, `TUNNEL`, or `CF_DNS`. `CF_DNS`
+rows only appear when `cf_zone_id` is configured.
 
 ### Quick checks
 
@@ -261,9 +271,54 @@ multi-tenant hosts, and do not publish port 8081 to the internet.
 There is no built-in authentication; put it behind a reverse proxy
 with auth if you need remote access.
 
-The Cloudflare API token only needs `Cloudflare Tunnel: Edit`
-permission for the configured tunnel/account. No DNS edit permissions
-are required because this plugin no longer touches Cloudflare DNS.
+The Cloudflare API token needs different permissions depending on
+which syncers you enable:
+
+| Feature | Token permission | Required when |
+|---|---|---|
+| Tunnel ingress sync | **Account → Cloudflare Tunnel: Edit** for the configured account | `cf_tunnel_id` is set |
+| DNS CNAME sync      | **Zone → DNS: Edit** for the configured zone           | `cf_zone_id` is set   |
+
+If you only enable the tunnel syncer, do not grant DNS edit; if you
+enable the DNS syncer, the token additionally needs Zone:DNS:Edit
+scoped to that one zone.
+
+Cloudflare DNS sync
+-------------------
+
+When the Cloudflare dashboard's tunnel "Public Hostnames" UI adds an
+entry for `app.example.com`, it actually does **two** things behind
+the scenes:
+
+1. Append the ingress rule to the tunnel's configuration.
+2. Create a proxied CNAME in your zone:
+   `app.example.com → <tunnel-id>.cfargotunnel.com`.
+
+The public Cloudflare API only does step (1). The CNAME has to be
+created separately, and without it public DNS for the hostname will
+not resolve to Cloudflare's edge — traffic never reaches the tunnel.
+
+Setting `cf_zone_id` enables the DNS syncer, which performs step (2)
+in lockstep with step (1):
+
+- For each FQDN added to the tunnel ingress, create or update a
+  proxied CNAME (`type=CNAME`, `content=<tunnel-id>.cfargotunnel.com`,
+  `proxied=true`, `ttl=1`) in the configured zone.
+- For each FQDN removed from the tunnel ingress, delete the
+  corresponding CNAME.
+- Records are tagged with the comment `managed by
+  coredns-dockerdiscovery`. The syncer **only updates or deletes
+  records carrying that comment**: any pre-existing record at the
+  same name (manual entry, A record, different CNAME, etc.) is left
+  alone and a warning is logged. This is the guardrail against
+  clobbering hand-managed records.
+- `cf_exclude` applies to both syncers — excluded FQDNs get neither
+  a tunnel ingress entry nor a CNAME.
+
+If you previously created the CNAMEs manually, either delete them
+first (the syncer will recreate them on the next event) or edit them
+and add the comment `managed by coredns-dockerdiscovery` so the
+syncer adopts them.
 
 Verifying a deployment
 ----------------------
@@ -295,6 +350,10 @@ Cloudflare:
   hostnames lists `portainer.177cpt.com`, `auth.177cpt.com`,
   `nexus.177cpt.com`, `traefik.177cpt.com`, all routed to
   `${CF_TUNNEL_TARGET}`.
+- When `cf_zone_id` is set: Cloudflare dashboard → DNS → your zone
+  shows proxied CNAME records for the same hostnames pointing at
+  `<tunnel-id>.cfargotunnel.com`, each carrying the comment
+  `managed by coredns-dockerdiscovery`.
 
 Stop a container; the corresponding inventory rows disappear within
 one event-loop tick, and any tunnel ingress entry it owned is

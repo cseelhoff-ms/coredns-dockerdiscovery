@@ -9,11 +9,26 @@ set -e
 : "${CF_TUNNEL_ID:=}"
 : "${CF_ACCOUNT_ID:=}"
 : "${CF_TUNNEL_TARGET:=}"
+: "${CF_ZONE_ID:=}"
 : "${CF_EXCLUDE:=}"
 : "${FORWARD_DNS:=1.1.1.1 8.8.8.8}"
 : "${CACHE_TTL:=30}"
 : "${INVENTORY_ADDR:=}"
 : "${INVENTORY_PATH:=}"
+
+# Fail fast on missing required combinations. Without these the plugin
+# rejects the Corefile and the container loops on restart, hiding the
+# real reason in a sea of "=== Generated Corefile ===" log entries.
+if [ -n "$CF_TUNNEL_ID" ] && [ -z "$CF_TUNNEL_TARGET" ]; then
+    echo "FATAL: CF_TUNNEL_ID is set but CF_TUNNEL_TARGET is empty." >&2
+    echo "Set CF_TUNNEL_TARGET to the backend service URL cloudflared should forward to," >&2
+    echo "e.g. https://localhost:443 for a co-located Traefik." >&2
+    exit 64
+fi
+if [ -n "$CF_TUNNEL_ID" ] && [ -z "$CF_TOKEN" ]; then
+    echo "FATAL: CF_TUNNEL_ID is set but CF_TOKEN is empty." >&2
+    exit 64
+fi
 
 # Build Corefile
 cat > /tmp/Corefile <<COREFILE
@@ -70,6 +85,12 @@ fi
 if [ -n "$CF_TUNNEL_TARGET" ]; then
 cat >> /tmp/Corefile <<COREFILE
         cf_tunnel_target ${CF_TUNNEL_TARGET}
+COREFILE
+fi
+
+if [ -n "$CF_ZONE_ID" ]; then
+cat >> /tmp/Corefile <<COREFILE
+        cf_zone_id ${CF_ZONE_ID}
 COREFILE
 fi
 

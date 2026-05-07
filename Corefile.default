@@ -10,6 +10,7 @@
         cf_tunnel_id {$CF_TUNNEL_ID}
         cf_account_id {$CF_ACCOUNT_ID}
         cf_tunnel_target {$CF_TUNNEL_TARGET}
+        cf_zone_id {$CF_ZONE_ID}
         inventory {$INVENTORY_ADDR}
     }
     forward . {$FORWARD_DNS1} {$FORWARD_DNS2}
